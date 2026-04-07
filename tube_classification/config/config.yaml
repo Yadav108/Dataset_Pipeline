@@ -1,0 +1,96 @@
+# Camera configuration: resolution, frame rate, and depth sensor range
+# OPTIMIZED: Using working resolution (848×480@30fps) with quality threshold improvements
+# TUNED FOR: 22cm camera-to-tube distance
+camera:
+  width: 848           # Working resolution (confirmed stable)
+  height: 480          # Working resolution (confirmed stable)
+  fps: 30              # Working frame rate (confirmed stable)
+  depth_min_m: 0.17    # 22cm - 5cm margin
+  depth_max_m: 0.27    # 22cm + 5cm margin
+
+# Storage configuration: data directory paths and session naming
+storage:
+  root_dir: dataset/raw
+  registry_path: config/registry.yaml
+  sam_weights_path: models/mobile_sam.pt
+  session_prefix: session
+
+# Pipeline configuration: processing thresholds and algorithm parameters
+pipeline:
+  stability_frames: 4
+  blur_threshold: 52.0          # Optimized for 848×480 resolution
+  duplicate_hash_threshold: 12
+  min_coverage_ratio: 0.48      # Stricter for better quality
+  min_roi_area_px: 300
+  sam_iou_threshold: 0.57       # Slightly lower for small tubes at 22cm (was 0.62)
+  depth_stability_threshold: 0.012
+  max_roi_area_px: 120000
+  min_tube_dim_px: 20
+  max_tube_dim_px: 350
+  min_tube_length_px: 40
+  max_tube_length_px: 900
+  min_solidity: 0.10
+  border_margin_px: 15
+
+  # Top-down capture mode shape filter
+  top_min_roi_area_px: 200
+  top_max_roi_area_px: 6000
+  top_min_tube_dim_px: 8
+  top_max_tube_dim_px: 80
+  top_max_circularity_ratio: 2.5
+  top_min_solidity: 0.35
+  top_border_margin_px: 30
+
+  # Top-down depth zone (camera pointing down at rack)
+  # Camera-to-rack distance: 42cm; margin ±5cm → [0.37, 0.47]
+  top_depth_min_m: 0.37
+  top_depth_max_m: 0.47
+
+  # Checkpoint configuration for crash recovery
+  checkpoint_interval: 25  # Save manifest snapshot every N successful captures
+
+  # Live preview window
+  show_preview: false  # Disable preview to reduce memory usage (set to true to enable)
+
+  # Per-class capture target
+  target_images_per_class: 500  # Stop capture when this many images collected for a class
+
+  # Background removal (final cleaning step)
+  background_removal: true  # Remove backgrounds from ROI crops and save separately
+
+  # Preview settings for live overhead view
+  preview:
+    depth_tolerance_mm: 20.0           # Depth threshold for occupation detection (mm below baseline)
+    grid_line_alpha: 0.3                # Transparency of grid overlay (0.0-1.0)
+    grid_line_color: [255, 255, 255]   # Grid line color (BGR)
+    occupied_color: [0, 255, 0]         # Occupied slot highlight color (BGR: green)
+    empty_color: [128, 128, 128]        # Empty slot color (BGR: gray)
+    fps_display: true                   # Show FPS in status bar
+
+  # Confirmation preview settings for per-slot review
+  confirmation:
+    zoom_factor: 4                      # Magnification of zoomed ROI view
+    depth_stable_variance_mm: 5.0       # Variance threshold for depth stability (mm)
+    depth_expected_mm: 330              # Expected depth baseline (mm)
+    blur_threshold: 82.0               # More consistent with main pipeline (was 100.0)
+    mask_confidence_threshold: 0.73    # Aligned with HD quality (was 0.85)
+    panel_width_px: 300                 # Width of metrics panel (pixels)
+    show_metrics: true                  # Display quality metrics in confirmation window
+
+  # Capture mode and session settings
+  capture:
+    mode_timeout_seconds: 60            # Timeout for user mode selection (seconds)
+    max_retries: 3                      # Maximum retakes per slot
+    auto_export_on_session_end: false   # Automatically export after session
+    log_level: 'INFO'                   # Logging level (DEBUG, INFO, WARNING, ERROR)
+    save_depth_frames: true             # Save depth as NPZ
+    save_segmentation_masks: true       # Save MobileSAM masks
+
+  # Session organization settings
+  session:
+    base_directory: 'dataset/sessions'  # Root directory for sessions
+    auto_resume: false                  # Automatically resume interrupted sessions
+    cleanup_on_reject: true             # Delete rejected captures immediately
+    compression_level: 9                # PNG compression (0-9)
+
+

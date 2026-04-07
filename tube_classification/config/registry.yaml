@@ -1,0 +1,147 @@
+# Tube registry: complete metadata for all 16 blood tube classes
+# Maps class identifiers to physical properties and visual patterns for model training
+
+tubes:
+  - class_id: VAC_PURPLE
+    family: VACUETTE
+    volume_ml: 4.0
+    diameter_mm: 13.0
+    cap_color: purple
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: VAC_RED
+    family: VACUETTE
+    volume_ml: 4.0
+    diameter_mm: 13.0
+    cap_color: red
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: VAC_GREEN
+    family: VACUETTE
+    volume_ml: 4.0
+    diameter_mm: 13.0
+    cap_color: green
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: VAC_LIGHTBLUE
+    family: VACUETTE
+    volume_ml: 4.0
+    diameter_mm: 13.0
+    cap_color: light blue
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: VAC_GRAY
+    family: VACUETTE
+    volume_ml: 4.0
+    diameter_mm: 13.0
+    cap_color: gray
+    cap_texture: bullseye
+    top_down_pattern: bullseye
+    ambiguous_with: [SAR_SM_GRAY]
+
+  - class_id: VAC_GOLD
+    family: VACUETTE
+    volume_ml: 4.0
+    diameter_mm: 13.0
+    cap_color: gold
+    cap_texture: smooth
+    top_down_pattern: ring
+    ambiguous_with: []
+
+  - class_id: SAR_YELLOW
+    family: SARSTEDT_REGULAR
+    volume_ml: 4.5
+    diameter_mm: 13.0
+    cap_color: yellow
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: SAR_GREEN_LARGE
+    family: SARSTEDT_REGULAR
+    volume_ml: 4.5
+    diameter_mm: 13.0
+    cap_color: green
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: [SAR_SM_GREEN]
+
+  - class_id: SAR_RED_LARGE
+    family: SARSTEDT_REGULAR
+    volume_ml: 4.5
+    diameter_mm: 13.0
+    cap_color: red
+    cap_texture: smooth
+    top_down_pattern: void_center
+    ambiguous_with: [SAR_SM_PINK]
+
+  - class_id: SAR_LAVENDER
+    family: SARSTEDT_REGULAR
+    volume_ml: 4.5
+    diameter_mm: 13.0
+    cap_color: lavender
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: SAR_BLUE
+    family: SARSTEDT_REGULAR
+    volume_ml: 4.5
+    diameter_mm: 13.0
+    cap_color: blue
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: SAR_SM_ORANGE
+    family: SARSTEDT_SMALL
+    volume_ml: 1.3
+    diameter_mm: 8.0
+    cap_color: orange
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: SAR_SM_GRAY
+    family: SARSTEDT_SMALL
+    volume_ml: 1.3
+    diameter_mm: 8.0
+    cap_color: gray
+    cap_texture: bullseye
+    top_down_pattern: bullseye
+    ambiguous_with: [VAC_GRAY]
+
+  - class_id: SAR_SM_CLEAR
+    family: SARSTEDT_SMALL
+    volume_ml: 1.3
+    diameter_mm: 8.0
+    cap_color: clear
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: []
+
+  - class_id: SAR_SM_GREEN
+    family: SARSTEDT_SMALL
+    volume_ml: 1.3
+    diameter_mm: 8.0
+    cap_color: green
+    cap_texture: smooth
+    top_down_pattern: solid
+    ambiguous_with: [SAR_GREEN_LARGE]
+
+  - class_id: SAR_SM_PINK
+    family: SARSTEDT_SMALL
+    volume_ml: 1.3
+    diameter_mm: 8.0
+    cap_color: pink
+    cap_texture: smooth
+    top_down_pattern: void_center
+    ambiguous_with: [SAR_RED_LARGE]
