@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quality Constellation - Dataset Visualization</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.7.0/p5.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&family=Lora:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Poppins', sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            min-height: 100vh;
+            display: flex;
+            overflow: hidden;
+        }
+
+        #canvas-container {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            position: relative;
+        }
+
+        #controls {
+            width: 320px;
+            background: white;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            overflow-y: auto;
+            border-left: 1px solid #e0e0e0;
+            font-size: 13px;
+        }
+
+        #controls h1 {
+            font-family: 'Lora', serif;
+            font-size: 18px;
+            color: #333;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+
+        #controls p {
+            font-size: 11px;
+            color: #999;
+            margin-bottom: 25px;
+            line-height: 1.4;
+        }
+
+        .control-section {
+            margin-bottom: 28px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        .control-section h2 {
+            font-size: 13px;
+            font-weight: 700;
+            color: #333;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 15px;
+            margin-top: 5px;
+        }
+
+        .control-group {
+            margin-bottom: 16px;
+        }
+
+        label {
+            display: block;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 6px;
+            font-size: 12px;
+        }
+
+        input[type="range"] {
+            width: 100%;
+            height: 6px;
+            border-radius: 3px;
+            background: #e0e0e0;
+            outline: none;
+            -webkit-appearance: none;
+            cursor: pointer;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            cursor: pointer;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+
+        input[type="range"]::-moz-range-thumb {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            cursor: pointer;
+            border: none;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+
+        .value-display {
+            display: inline-block;
+            background: #f5f5f5;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            color: #666;
+            font-weight: 500;
+            margin-top: 4px;
+            font-family: 'Courier New', monospace;
+        }
+
+        .seed-controls {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+
+        button {
+            flex: 1;
+            padding: 9px 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 11px;
+            transition: all 0.3s ease;
+            font-family: 'Poppins', sans-serif;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button.action-button {
+            flex: 0 1 calc(50% - 3px);
+            padding: 8px 10px;
+        }
+
+        #seed-input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 11px;
+            font-family: 'Courier New', monospace;
+            margin-bottom: 8px;
+        }
+
+        .seed-display {
+            background: #f9f9f9;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            font-weight: 600;
+            color: #667eea;
+            margin-bottom: 10px;
+            border: 1px solid #e8e8e8;
+        }
+
+        hr {
+            border: none;
+            border-top: 1px solid #f0f0f0;
+            margin: 20px 0;
+        }
+
+        .info-box {
+            background: #f0f4ff;
+            border-left: 3px solid #667eea;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            color: #555;
+            line-height: 1.5;
+            margin-top: 20px;
+        }
+
+        .footer {
+            font-size: 10px;
+            color: #999;
+            text-align: center;
+            margin-top: 20px;
+            padding-top: 15px;
+            border-top: 1px solid #f0f0f0;
+        }
+
+        /* Scrollbar styling */
+        #controls::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        #controls::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+
+        #controls::-webkit-scrollbar-thumb {
+            background: #ddd;
+            border-radius: 3px;
+        }
+
+        #controls::-webkit-scrollbar-thumb:hover {
+            background: #999;
+        }
+
+        .metrics-info {
+            background: #fafafa;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 10px;
+            color: #666;
+            line-height: 1.6;
+            margin-top: 10px;
+        }
+
+        .metrics-info strong {
+            color: #333;
+            display: block;
+            margin-top: 6px;
+            margin-bottom: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="controls">
+        <h1>Quality Constellation</h1>
+        <p>Interactive visualization of dataset quality metrics as a living constellation.</p>
+
+        <!-- SEED CONTROL SECTION -->
+        <div class="control-section">
+            <h2>Seed Navigation</h2>
+
+            <div class="seed-display" id="seed-display">Seed: 12345</div>
+
+            <div class="seed-controls">
+                <button onclick="prevSeed()">← Prev</button>
+                <button onclick="randomSeed()">⚡ Random</button>
+                <button onclick="nextSeed()">Next →</button>
+            </div>
+
+            <input type="text" id="seed-input" placeholder="Jump to seed (0-9999)" />
+            <button onclick="jumpToSeed()" style="width: 100%; margin-bottom: 10px;">Go to Seed</button>
+        </div>
+
+        <!-- PARAMETERS SECTION -->
+        <div class="control-section">
+            <h2>Parameters</h2>
+
+            <div class="control-group">
+                <label>Particle Count</label>
+                <input type="range" id="particleCount" min="50" max="2000" value="500" step="50" 
+                    oninput="updateParam('particleCount', this.value)">
+                <span class="value-display" id="particleCount-value">500</span>
+            </div>
+
+            <div class="control-group">
+                <label>Particle Speed</label>
+                <input type="range" id="particleSpeed" min="0.5" max="5.0" value="2.0" step="0.5" 
+                    oninput="updateParam('particleSpeed', this.value)">
+                <span class="value-display" id="particleSpeed-value">2.0</span>
+            </div>
+
+            <div class="control-group">
+                <label>Attraction Strength</label>
+                <input type="range" id="attractionStrength" min="0.01" max="0.5" value="0.08" step="0.01" 
+                    oninput="updateParam('attractionStrength', this.value)">
+                <span class="value-display" id="attractionStrength-value">0.08</span>
+            </div>
+
+            <div class="control-group">
+                <label>Trail Length</label>
+                <input type="range" id="trailLength" min="5" max="150" value="50" step="5" 
+                    oninput="updateParam('trailLength', this.value)">
+                <span class="value-display" id="trailLength-value">50</span>
+            </div>
+
+            <div class="control-group">
+                <label>Particle Opacity</label>
+                <input type="range" id="particleAlpha" min="10" max="200" value="80" step="10" 
+                    oninput="updateParam('particleAlpha', this.value)">
+                <span class="value-display" id="particleAlpha-value">80</span>
+            </div>
+        </div>
+
+        <!-- COLORS SECTION (OPTIONAL) -->
+        <div class="control-section">
+            <h2>Colors</h2>
+
+            <div class="control-group">
+                <label>Low Quality Color</label>
+                <input type="color" id="colorLow" value="#FF6B6B" style="width: 100%; height: 32px; border: 1px solid #ddd; border-radius: 4px; cursor: pointer;">
+            </div>
+
+            <div class="control-group">
+                <label>High Quality Color</label>
+                <input type="color" id="colorHigh" value="#4ECDC4" style="width: 100%; height: 32px; border: 1px solid #ddd; border-radius: 4px; cursor: pointer;">
+            </div>
+        </div>
+
+        <!-- ACTIONS SECTION -->
+        <div class="control-section">
+            <h2>Actions</h2>
+            <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+                <button class="action-button" onclick="regenerate()">Regenerate</button>
+                <button class="action-button" onclick="reset()">Reset</button>
+            </div>
+            <button onclick="downloadPNG()" style="width: 100%;">⬇ Download PNG</button>
+        </div>
+
+        <!-- INFO SECTION -->
+        <div class="info-box">
+            <strong>How to Use:</strong>
+            <div>Navigate through different "seeds" to explore variations of your dataset's quality space. Each seed reveals a different artistic interpretation of the same data.</div>
+        </div>
+
+        <div class="metrics-info">
+            <strong>Data Mapping:</strong>
+            X-axis: Blur Score (Sharpness)<br>
+            Y-axis: Coverage Ratio<br>
+            Size: SAM Confidence<br>
+            Brightness: Depth Stability
+        </div>
+
+        <div class="footer">
+            Quality Constellation v1.0<br>
+            Algorithmic Art by Copilot
+        </div>
+    </div>
+
+    <script>
+        // ============================================================================
+        // QUALITY CONSTELLATION: Interactive p5.js Implementation
+        // ============================================================================
+
+        let params = {
+            seed: 12345,
+            particleCount: 500,
+            particleSpeed: 2.0,
+            attractionStrength: 0.08,
+            trailLength: 50,
+            particleAlpha: 80
+        };
+
+        let metricsData = null;
+        let particles = [];
+        let starPositions = [];
+        let p5Instance = null;
+
+        // Sample metrics data (will be replaced with real data in production)
+        const SAMPLE_METRICS = {
+            "session_id": "demo_session_001",
+            "total_frames": 150,
+            "images": [
+                // Generate sample data
+                ...Array.from({ length: 150 }, (_, i) => ({
+                    "frame_id": i,
+                    "blur_score": 25 + Math.random() * 50,
+                    "coverage_ratio": 0.3 + Math.random() * 0.6,
+                    "sam_iou_score": 0.5 + Math.random() * 0.45,
+                    "depth_stability": 0.4 + Math.random() * 0.5
+                }))
+            ],
+            "statistics": {
+                "blur_score": { "min": 20, "max": 75, "mean": 45 },
+                "coverage_ratio": { "min": 0.3, "max": 0.9, "mean": 0.58 },
+                "sam_iou_score": { "min": 0.5, "max": 0.95, "mean": 0.68 },
+                "depth_stability": { "min": 0.4, "max": 0.95, "mean": 0.65 }
+            }
+        };
+
+        // Initialize p5.js sketch
+        const sketch = (p) => {
+            p.setup = function() {
+                let container = document.getElementById('canvas-container');
+                let width = container.offsetWidth;
+                let height = container.offsetHeight;
+                
+                p.createCanvas(width, height);
+                
+                // Load or use sample data
+                metricsData = window.METRICS_DATA || SAMPLE_METRICS;
+                normalizeMetrics();
+                buildConstellationPositions();
+                initializeParticles(p);
+            };
+
+            p.draw = function() {
+                p.background(245, 245, 245);
+                
+                drawAxes(p);
+                drawConstellation(p);
+                updateParticles(p);
+                drawParticles(p);
+                drawLabels(p);
+            };
+
+            p.windowResized = function() {
+                if (document.getElementById('canvas-container')) {
+                    let container = document.getElementById('canvas-container');
+                    let width = container.offsetWidth;
+                    let height = container.offsetHeight;
+                    p.resizeCanvas(width, height);
+                }
+            };
+        };
+
+        // Create p5 instance
+        p5Instance = new p5(sketch, 'canvas-container');
+
+        // ============================================================================
+        // CORE FUNCTIONS
+        // ============================================================================
+
+        function normalizeMetrics() {
+            if (!metricsData || !metricsData.images) return;
+            
+            const stats = metricsData.statistics;
+            
+            metricsData.images.forEach(frame => {
+                // Normalize blur score
+                const blurStats = stats.blur_score;
+                frame.blur_norm = (frame.blur_score - blurStats.min) / 
+                                  (blurStats.max - blurStats.min || 1);
+                
+                // Normalize coverage
+                const coverageStats = stats.coverage_ratio;
+                frame.coverage_norm = (frame.coverage_ratio - coverageStats.min) / 
+                                      (coverageStats.max - coverageStats.min || 1);
+                
+                // Normalize IoU
+                const iouStats = stats.sam_iou_score;
+                frame.iou_norm = (frame.sam_iou_score - iouStats.min) / 
+                                 (iouStats.max - iouStats.min || 1);
+                
+                // Normalize stability
+                const stabilityStats = stats.depth_stability;
+                frame.stability_norm = (frame.depth_stability - stabilityStats.min) / 
+                                       (stabilityStats.max - stabilityStats.min || 1);
+            });
+        }
+
+        function buildConstellationPositions() {
+            if (!metricsData || !metricsData.images) return;
+            
+            starPositions = metricsData.images.map(frame => {
+                const canvWidth = p5Instance.width;
+                const canvHeight = p5Instance.height;
+                
+                const x = p5Instance.map(frame.blur_norm, 0, 1, 50, canvWidth - 50);
+                const y = p5Instance.map(frame.coverage_norm, 0, 1, canvHeight - 50, 50);
+                
+                const size = p5Instance.map(frame.iou_norm, 0, 1, 4, 14);
+                const brightness = p5Instance.map(frame.stability_norm, 0, 1, 120, 255);
+                
+                return { x, y, size, brightness, iou: frame.iou_norm };
+            });
+        }
+
+        function initializeParticles(p) {
+            particles = [];
+            for (let i = 0; i < params.particleCount; i++) {
+                particles.push({
+                    x: p.random(p.width),
+                    y: p.random(p.height),
+                    vx: 0,
+                    vy: 0,
+                    trail: [],
+                    quality: 0.5
+                });
+            }
+        }
+
+        function drawAxes(p) {
+            p.stroke(200);
+            p.strokeWeight(2);
+            
+            const padding = 50;
+            
+            // X-axis
+            p.line(padding, p.height - padding, p.width - padding, p.height - padding);
+            
+            // Y-axis
+            p.line(padding, padding, padding, p.height - padding);
+            
+            // Axis tick marks
+            p.strokeWeight(1);
+            for (let i = 0; i <= 5; i++) {
+                const x = p.map(i, 0, 5, padding, p.width - padding);
+                const y = p.map(i, 0, 5, p.height - padding, padding);
+                
+                p.line(x, p.height - padding - 5, x, p.height - padding + 5);
+                p.line(padding - 5, y, padding + 5, y);
+            }
+        }
+
+        function drawConstellation(p) {
+            // Draw stars
+            starPositions.forEach((star, i) => {
+                const colorLow = document.getElementById('colorLow').value;
+                const colorHigh = document.getElementById('colorHigh').value;
+                const blendColor = p.lerpColor(
+                    p.color(colorLow),
+                    p.color(colorHigh),
+                    star.iou
+                );
+                
+                p.fill(blendColor);
+                p.stroke(50, 50, 50, 100);
+                p.strokeWeight(0.5);
+                p.ellipse(star.x, star.y, star.size);
+                
+                // Subtle glow for high-quality stars
+                if (star.iou > 0.7) {
+                    p.noFill();
+                    p.stroke(255, 255, 255, 50);
+                    p.strokeWeight(1);
+                    p.ellipse(star.x, star.y, star.size + 4);
+                }
+            });
+        }
+
+        function updateParticles(p) {
+            const targetQuality = p.createVector(p.width - 50, 50);
+            
+            particles.forEach(particle => {
+                const toTarget = p5.Vector.sub(targetQuality, p.createVector(particle.x, particle.y));
+                toTarget.normalize();
+                toTarget.mult(params.attractionStrength);
+                
+                particle.vx += toTarget.x;
+                particle.vy += toTarget.y;
+                
+                particle.vx *= 0.95;
+                particle.vy *= 0.95;
+                
+                particle.x += particle.vx * params.particleSpeed;
+                particle.y += particle.vy * params.particleSpeed;
+                
+                // Wrap edges
+                if (particle.x < 0) particle.x = p.width;
+                if (particle.x > p.width) particle.x = 0;
+                if (particle.y < 0) particle.y = p.height;
+                if (particle.y > p.height) particle.y = 0;
+                
+                // Quality metric (how close to high-quality region)
+                const dist = p.dist(particle.x, particle.y, p.width - 50, 50);
+                particle.quality = p.map(dist, 0, p.width, 1, 0, true);
+                
+                // Record trail
+                particle.trail.push(p.createVector(particle.x, particle.y));
+                if (particle.trail.length > params.trailLength) {
+                    particle.trail.shift();
+                }
+            });
+        }
+
+        function drawParticles(p) {
+            const colorLow = document.getElementById('colorLow').value;
+            const colorHigh = document.getElementById('colorHigh').value;
+            
+            particles.forEach(particle => {
+                // Draw trail
+                p.strokeWeight(1);
+                p.noFill();
+                
+                for (let i = 0; i < particle.trail.length - 1; i++) {
+                    const alpha = p.map(i, 0, particle.trail.length, 10, params.particleAlpha);
+                    const trailColor = p.lerpColor(
+                        p.color(colorLow),
+                        p.color(colorHigh),
+                        particle.quality
+                    );
+                    
+                    p.stroke(trailColor);
+                    p.stroke(p.red(trailColor), p.green(trailColor), p.blue(trailColor), alpha);
+                    
+                    p.line(
+                        particle.trail[i].x, particle.trail[i].y,
+                        particle.trail[i + 1].x, particle.trail[i + 1].y
+                    );
+                }
+                
+                // Draw particle
+                const particleColor = p.lerpColor(
+                    p.color(colorLow),
+                    p.color(colorHigh),
+                    particle.quality
+                );
+                p.fill(particleColor);
+                p.noStroke();
+                p.ellipse(particle.x, particle.y, 3);
+            });
+        }
+
+        function drawLabels(p) {
+            p.fill(100);
+            p.textAlign(p.CENTER);
+            p.textSize(12);
+            p.text("Blur Score (Sharpness) →", p.width / 2, p.height - 15);
+            
+            p.push();
+            p.translate(15, p.height / 2);
+            p.rotate(-Math.PI / 2);
+            p.text("Coverage Ratio →", 0, 0);
+            p.pop();
+        }
+
+        // ============================================================================
+        // UI HANDLERS
+        // ============================================================================
+
+        function updateParam(name, value) {
+            params[name] = parseFloat(value);
+            document.getElementById(name + '-value').textContent = value;
+            
+            if (name === 'particleCount') {
+                initializeParticles(p5Instance);
+            }
+        }
+
+        function prevSeed() {
+            params.seed = (params.seed - 1 + 10000) % 10000;
+            updateSeedDisplay();
+            regenerateWithSeed();
+        }
+
+        function nextSeed() {
+            params.seed = (params.seed + 1) % 10000;
+            updateSeedDisplay();
+            regenerateWithSeed();
+        }
+
+        function randomSeed() {
+            params.seed = Math.floor(Math.random() * 10000);
+            updateSeedDisplay();
+            regenerateWithSeed();
+        }
+
+        function jumpToSeed() {
+            const input = document.getElementById('seed-input').value;
+            const seed = parseInt(input);
+            if (!isNaN(seed) && seed >= 0 && seed <= 9999) {
+                params.seed = seed;
+                updateSeedDisplay();
+                regenerateWithSeed();
+                document.getElementById('seed-input').value = '';
+            }
+        }
+
+        function updateSeedDisplay() {
+            document.getElementById('seed-display').textContent = `Seed: ${params.seed}`;
+        }
+
+        function regenerateWithSeed() {
+            // Seed the random number generators
+            Math.seedrandom = function(seed) {
+                let x = Math.sin(seed) * 10000;
+                return x - Math.floor(x);
+            };
+            
+            // Reinitialize particles with new seed
+            initializeParticles(p5Instance);
+        }
+
+        function regenerate() {
+            params.seed = Math.floor(Math.random() * 10000);
+            updateSeedDisplay();
+            regenerateWithSeed();
+        }
+
+        function reset() {
+            params = {
+                seed: 12345,
+                particleCount: 500,
+                particleSpeed: 2.0,
+                attractionStrength: 0.08,
+                trailLength: 50,
+                particleAlpha: 80
+            };
+            
+            // Reset all sliders
+            document.getElementById('particleCount').value = 500;
+            document.getElementById('particleSpeed').value = 2.0;
+            document.getElementById('attractionStrength').value = 0.08;
+            document.getElementById('trailLength').value = 50;
+            document.getElementById('particleAlpha').value = 80;
+            
+            // Update displays
+            document.getElementById('particleCount-value').textContent = '500';
+            document.getElementById('particleSpeed-value').textContent = '2.0';
+            document.getElementById('attractionStrength-value').textContent = '0.08';
+            document.getElementById('trailLength-value').textContent = '50';
+            document.getElementById('particleAlpha-value').textContent = '80';
+            
+            updateSeedDisplay();
+            regenerateWithSeed();
+        }
+
+        function downloadPNG() {
+            if (p5Instance && p5Instance.saveCanvas) {
+                p5Instance.saveCanvas(`constellation_${params.seed}`, 'png');
+            }
+        }
+
+        // Initialize displays on load
+        document.addEventListener('DOMContentLoaded', function() {
+            updateSeedDisplay();
+        });
+
+    </script>
+</body>
+</html>
