@@ -123,6 +123,11 @@ pipeline:
 
 
 preprocessing:
+  bilateral:
+    enabled: true
+    # Base budget at 640x480; runtime scales this with frame pixel count.
+    # 1920x1080 aligned depth frames need a higher baseline to avoid false timeouts.
+    max_processing_time_ms: 250.0
   guided_filter:
     enabled: true
     radius: 8

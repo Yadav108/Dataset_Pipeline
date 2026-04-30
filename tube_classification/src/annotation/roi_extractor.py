@@ -244,6 +244,7 @@ class DepthROIExtractor:
         depth_min: float,
         depth_max: float,
         initial_mask: np.ndarray | None = None,
+        remove_bottom_components: bool = True,
     ) -> np.ndarray:
         """Clean depth frame and return binary mask for valid depth range.
 
@@ -286,33 +287,34 @@ class DepthROIExtractor:
         kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
 
-        # Remove holder/turntable-like components connected to the bottom edge.
-        # These are typically wide blobs that dominate ROI selection.
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        H, W = mask.shape
-        cleaned = mask.copy()
-        for lbl in range(1, num_labels):
-            x = int(stats[lbl, cv2.CC_STAT_LEFT])
-            y = int(stats[lbl, cv2.CC_STAT_TOP])
-            w = int(stats[lbl, cv2.CC_STAT_WIDTH])
-            h = int(stats[lbl, cv2.CC_STAT_HEIGHT])
-            area = int(stats[lbl, cv2.CC_STAT_AREA])
-            touches_bottom = (y + h) >= (H - 2)
-            width_ratio = w / float(W)
-            area_ratio = area / float(H * W)
+        if remove_bottom_components:
+            # Remove holder/turntable-like components connected to the bottom edge.
+            # These are typically wide blobs that dominate ROI selection.
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            H, W = mask.shape
+            cleaned = mask.copy()
+            for lbl in range(1, num_labels):
+                x = int(stats[lbl, cv2.CC_STAT_LEFT])
+                y = int(stats[lbl, cv2.CC_STAT_TOP])
+                w = int(stats[lbl, cv2.CC_STAT_WIDTH])
+                h = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+                area = int(stats[lbl, cv2.CC_STAT_AREA])
+                touches_bottom = (y + h) >= (H - 2)
+                width_ratio = w / float(W)
+                area_ratio = area / float(H * W)
 
-            remove_bottom_holder = (
-                touches_bottom
-                and (
-                    width_ratio >= 0.06
-                    or area_ratio >= 0.003
-                    or (h >= int(0.06 * H) and width_ratio >= 0.045)
+                remove_bottom_holder = (
+                    touches_bottom
+                    and (
+                        width_ratio >= 0.06
+                        or area_ratio >= 0.003
+                        or (h >= int(0.06 * H) and width_ratio >= 0.045)
+                    )
                 )
-            )
-            if remove_bottom_holder:
-                cleaned[labels == lbl] = 0
+                if remove_bottom_holder:
+                    cleaned[labels == lbl] = 0
 
-        mask = cleaned
+            mask = cleaned
         
         if not self._debug_mask_saved:
             try:
@@ -1069,107 +1071,248 @@ class DepthROIExtractor:
         Returns:
             Tuple of (x, y, width, height) or None if no valid ROI found
         """
+        # single_top must always use top-view prompting downstream.
+        self._orientation = 'top'
+        self._is_inverted = False
+
         # Step 1 — Preprocessing
         depth_min = self.cfg.pipeline.top_depth_min_m
         depth_max = self.cfg.pipeline.top_depth_max_m
-        mask = self._preprocess_depth(depth_frame, depth_min, depth_max)
-        
+        mask = self._preprocess_depth(
+            depth_frame, depth_min, depth_max, remove_bottom_components=False
+        )
+        base_nonzero = int(cv2.countNonZero(mask))
+
+        # If configured top depth gate is stale for current setup (e.g. 17-19cm),
+        # derive a temporary per-frame gate around the nearest valid depth.
+        if base_nonzero < 120:
+            mm_min = int(0.06 / self._depth_scale)
+            mm_max = int(0.80 / self._depth_scale)
+            valid = depth_frame[(depth_frame >= mm_min) & (depth_frame <= mm_max)]
+            if len(valid) > 1000:
+                near_m = float(np.percentile(valid, 4)) * self._depth_scale
+                adaptive_min = max(0.06, near_m - 0.03)
+                adaptive_max = min(0.80, near_m + 0.06)
+                adaptive_mask = self._preprocess_depth(
+                    depth_frame, adaptive_min, adaptive_max, remove_bottom_components=False
+                )
+                adaptive_nonzero = int(cv2.countNonZero(adaptive_mask))
+                if adaptive_nonzero > max(300, base_nonzero * 2):
+                    mask = adaptive_mask
+                    logger.debug(
+                        f"[single_top] Adaptive depth gate engaged: "
+                        f"configured={depth_min:.3f}-{depth_max:.3f}m, "
+                        f"adaptive={adaptive_min:.3f}-{adaptive_max:.3f}m, "
+                        f"mask_pixels={base_nonzero}->{adaptive_nonzero}"
+                    )
+
+        H, W = mask.shape
+        frame_cx, frame_cy = W // 2, H // 2
+        border_margin = int(self.cfg.pipeline.top_border_margin_px)
+        min_radius = int(self.cfg.pipeline.top_min_tube_dim_px // 2)
+        max_radius = int(self.cfg.pipeline.top_max_tube_dim_px // 2)
+
+        # Step 1b — Tube caps protrude above the rack plane, so they sit at a depth
+        # SHALLOWER than top_depth_min_m. When the rack surface dominates the mask
+        # (>30 % of frame pixels are in-range), the tube cap appears as a black hole
+        # in that mask. Switch to a close-object mask so HoughCircles and contour
+        # search see the tube cap as a white blob instead of a dark void.
+        detection_mask = mask
+        _rack_dominated = base_nonzero > H * W * 0.30
+        if _rack_dominated:
+            depth_min_mm_raw = int(depth_min / self._depth_scale)
+            min_sensor_mm = int(0.05 / self._depth_scale)
+            close_candidate = (
+                (depth_frame >= min_sensor_mm) & (depth_frame < depth_min_mm_raw)
+            ).astype(np.uint8) * 255
+            close_candidate = cv2.medianBlur(close_candidate, 5)
+            _k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            close_candidate = cv2.morphologyEx(close_candidate, cv2.MORPH_CLOSE, _k)
+            close_candidate = cv2.morphologyEx(close_candidate, cv2.MORPH_OPEN, _k)
+            close_nonzero = int(cv2.countNonZero(close_candidate))
+            if close_nonzero >= 50:
+                detection_mask = close_candidate
+                logger.debug(
+                    f"[single_top] Rack mask ({base_nonzero}px in-range) → "
+                    f"switched to close-object mask ({close_nonzero}px) for tube-cap detection"
+                )
+            else:
+                # Rack fills the frame but nothing protrudes above it — no tube present.
+                logger.debug(
+                    f"[single_top] Rack mask ({base_nonzero}px) and close-object mask "
+                    f"empty ({close_nonzero}px) — no tube cap found"
+                )
+                return None
+
         # ─────────────────────────────────
         # PRIMARY PATH — HoughCircles
         # ─────────────────────────────────
-        
-        circles = cv2.HoughCircles(
-            mask,
-            cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=30,
-            param1=50,
-            param2=30,
-            minRadius=int(self.cfg.pipeline.top_min_tube_dim_px // 2),
-            maxRadius=int(self.cfg.pipeline.top_max_tube_dim_px // 2)
-        )
-        
-        if circles is not None:
+
+        # Downsample to ~half resolution before HoughCircles to bound memory use.
+        # On a 1920×1080 aligned depth frame the full-res accumulator can exceed
+        # available RAM after SAM has loaded; 0.5× keeps it well under 2 MB.
+        _HS = 0.5
+        hough_h = max(1, int(H * _HS))
+        hough_w = max(1, int(W * _HS))
+        hough_small = cv2.resize(detection_mask, (hough_w, hough_h), interpolation=cv2.INTER_AREA)
+        hough_input = cv2.GaussianBlur(hough_small, (9, 9), 1.5)
+        hough_min_r = max(1, int(min_radius * _HS))
+        hough_max_r = max(hough_min_r + 1, int(max_radius * _HS))
+
+        hough_profiles = [
+            (1.2, 30, 50, 30),  # strict/default
+            (1.1, 24, 45, 24),  # medium
+            (1.0, 18, 40, 20),  # relaxed
+        ]
+        circle_candidates = []
+        for dp, min_dist, p1, p2 in hough_profiles:
+            circles = cv2.HoughCircles(
+                hough_input,
+                cv2.HOUGH_GRADIENT,
+                dp=dp,
+                minDist=max(1, int(min_dist * _HS)),
+                param1=p1,
+                param2=p2,
+                minRadius=hough_min_r,
+                maxRadius=hough_max_r,
+            )
+            if circles is None:
+                continue
             circles = np.uint16(np.around(circles[0]))
-            candidates = []
-            
-            for (cx, cy, r) in circles:
-                # Convert circle to bbox
-                x = int(cx - r)
-                y = int(cy - r)
-                w = int(2 * r)
-                h = int(2 * r)
-                
-                # Border margin check
-                m = self.cfg.pipeline.top_border_margin_px
-                H, W = mask.shape
-                if x < m or y < m or x + w > W - m or y + h > H - m:
+            for (cx_s, cy_s, r_s) in circles:
+                # Scale coordinates back to original resolution
+                cx = int(round(cx_s / _HS))
+                cy = int(round(cy_s / _HS))
+                r = int(round(r_s / _HS))
+                x = cx - r
+                y = cy - r
+                w = 2 * r
+                h = 2 * r
+                if x < border_margin or y < border_margin or x + w > W - border_margin or y + h > H - border_margin:
                     continue
-                
-                candidates.append((x, y, w, h, r))
-            
-            if candidates:
-                # Select circle closest to frame center
-                frame_cx, frame_cy = mask.shape[1] // 2, mask.shape[0] // 2
-                best = min(
-                    candidates,
-                    key=lambda c: (c[0] + c[2] // 2 - frame_cx) ** 2
-                                  + (c[1] + c[3] // 2 - frame_cy) ** 2
-                )
-                x, y, w, h, _ = best
-                logger.debug(f"[single_top] HoughCircles ROI: ({x},{y},{w},{h})")
-                return (x, y, w, h)
+                dist2 = (cx - frame_cx) ** 2 + (cy - frame_cy) ** 2
+                circle_candidates.append((x, y, w, h, r, dist2))
+
+        if circle_candidates:
+            best = min(circle_candidates, key=lambda c: (c[5], -c[4]))
+            x, y, w, h, _, _ = best
+            logger.debug(f"[single_top] HoughCircles ROI: ({x},{y},{w},{h})")
+            return (x, y, w, h)
         
         # ─────────────────────────────────
         # FALLBACK PATH — Contour-based
         # ─────────────────────────────────
         
         logger.debug("[single_top] HoughCircles found nothing — falling back to contour")
-        
+
         contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            detection_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         
         if not contours:
             return None
-        
-        candidates = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if not (self.cfg.pipeline.top_min_roi_area_px <= area <= self.cfg.pipeline.top_max_roi_area_px):
-                continue
-            
-            x, y, w, h = cv2.boundingRect(contour)
-            short_dim = min(w, h)
-            long_dim = max(w, h)
-            
-            if not (self.cfg.pipeline.top_min_tube_dim_px <= short_dim <= self.cfg.pipeline.top_max_tube_dim_px):
-                continue
-            
-            circularity_ratio = long_dim / (short_dim + 1e-6)
-            if circularity_ratio > self.cfg.pipeline.top_max_circularity_ratio:
-                continue
-            
-            hull = cv2.convexHull(contour)
-            hull_area = cv2.contourArea(hull)
-            if hull_area == 0:
-                continue
-            solidity = area / hull_area
-            if solidity < self.cfg.pipeline.top_min_solidity:
-                continue
-            
-            m = self.cfg.pipeline.top_border_margin_px
-            H, W = mask.shape
-            if x < m or y < m or x + w > W - m or y + h > H - m:
-                continue
-            
-            candidates.append((x, y, w, h, solidity))
-        
+
+        def _collect_candidates(
+            min_area: float,
+            max_area: float,
+            min_dim: float,
+            max_dim: float,
+            max_ratio: float,
+            min_solidity: float,
+            margin: int,
+        ) -> list[tuple[int, int, int, int, float, int, float]]:
+            cands = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if not (min_area <= area <= max_area):
+                    continue
+
+                x, y, w, h = cv2.boundingRect(contour)
+                short_dim = min(w, h)
+                long_dim = max(w, h)
+                if not (min_dim <= short_dim <= max_dim):
+                    continue
+
+                circularity_ratio = long_dim / (short_dim + 1e-6)
+                if circularity_ratio > max_ratio:
+                    continue
+
+                hull = cv2.convexHull(contour)
+                hull_area = cv2.contourArea(hull)
+                if hull_area == 0:
+                    continue
+                solidity = area / hull_area
+                if solidity < min_solidity:
+                    continue
+
+                if x < margin or y < margin or x + w > W - margin or y + h > H - margin:
+                    continue
+
+                cx = x + w // 2
+                cy = y + h // 2
+                dist2 = (cx - frame_cx) ** 2 + (cy - frame_cy) ** 2
+                cands.append((x, y, w, h, solidity, dist2, float(area)))
+            return cands
+
+        strict_candidates = _collect_candidates(
+            min_area=float(self.cfg.pipeline.top_min_roi_area_px),
+            max_area=float(self.cfg.pipeline.top_max_roi_area_px),
+            min_dim=float(self.cfg.pipeline.top_min_tube_dim_px),
+            max_dim=float(self.cfg.pipeline.top_max_tube_dim_px),
+            max_ratio=float(self.cfg.pipeline.top_max_circularity_ratio),
+            min_solidity=float(self.cfg.pipeline.top_min_solidity),
+            margin=border_margin,
+        )
+
+        candidates = strict_candidates
         if not candidates:
+            relaxed_margin = max(10, border_margin - 10)
+            relaxed_min_solidity = max(0.22, float(self.cfg.pipeline.top_min_solidity) - 0.12)
+            candidates = _collect_candidates(
+                min_area=float(self.cfg.pipeline.top_min_roi_area_px) * 0.70,
+                max_area=float(self.cfg.pipeline.top_max_roi_area_px) * 1.25,
+                min_dim=float(self.cfg.pipeline.top_min_tube_dim_px) * 0.80,
+                max_dim=float(self.cfg.pipeline.top_max_tube_dim_px) * 1.15,
+                max_ratio=float(self.cfg.pipeline.top_max_circularity_ratio) + 0.80,
+                min_solidity=relaxed_min_solidity,
+                margin=relaxed_margin,
+            )
+            if candidates:
+                logger.debug(
+                    f"[single_top] Contour fallback recovered ROI using relaxed filters "
+                    f"(margin={relaxed_margin}, min_solidity={relaxed_min_solidity:.2f})"
+                )
+
+        if not candidates:
+            # Last-resort path: pick strongest connected contour near frame center
+            # with extremely permissive shape checks for close-range top captures.
+            emergency = []
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area < 120.0:
+                    continue
+                (cx_f, cy_f), r_f = cv2.minEnclosingCircle(contour)
+                r = int(max(3.0, r_f))
+                cx = int(cx_f)
+                cy = int(cy_f)
+                x = cx - r
+                y = cy - r
+                w = 2 * r
+                h = 2 * r
+                if x < 2 or y < 2 or x + w > W - 2 or y + h > H - 2:
+                    continue
+                dist2 = (cx - frame_cx) ** 2 + (cy - frame_cy) ** 2
+                emergency.append((x, y, w, h, area, dist2))
+            if emergency:
+                x, y, w, h, _, _ = max(emergency, key=lambda c: (c[4], -c[5]))
+                logger.debug(
+                    f"[single_top] Emergency contour ROI: ({x},{y},{w},{h})"
+                )
+                return (x, y, w, h)
             return None
-        
-        best = max(candidates, key=lambda c: c[-1])
-        x, y, w, h, _ = best
+
+        best = max(candidates, key=lambda c: (c[4], -c[5], c[6]))
+        x, y, w, h, _, _, _ = best
         logger.debug(f"[single_top] Contour fallback ROI: ({x},{y},{w},{h})")
         return (x, y, w, h)
     
@@ -1190,8 +1333,9 @@ class DepthROIExtractor:
         # Step 1 — Preprocessing
         depth_min = self.cfg.pipeline.top_depth_min_m
         depth_max = self.cfg.pipeline.top_depth_max_m
-        mask = self._preprocess_depth(depth_frame, depth_min, depth_max)
-        
+        mask = self._preprocess_depth(
+            depth_frame, depth_min, depth_max, remove_bottom_components=False
+        )        
         # Step 2 — Watershed to separate touching blobs
         
         # Distance transform

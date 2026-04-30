@@ -81,7 +81,10 @@ class PipelineConfig(BaseModel):
     
     # Background removal (final cleaning step)
     background_removal: bool = True
-    
+
+    # Art/visualization export after session
+    enable_art_export: bool = False
+
     sam_iou_threshold: float
     depth_stability_threshold: float
     # Maximum allowed mean absolute difference (in meters) between
