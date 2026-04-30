@@ -5,6 +5,7 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
 import yaml
 
@@ -118,6 +119,7 @@ def main():
     parser.add_argument('--session-id', default=None, help='Resume interrupted session')
     parser.add_argument('--skip-preview', action='store_true', help='Skip live preview (testing)')
     parser.add_argument('--dry-run', action='store_true', help='Run without camera')
+    parser.add_argument('--skip-pre-capture', action='store_true', help='Skip pre-capture data entry')
     args = parser.parse_args()
     
     print("\n" + "="*60)
@@ -146,6 +148,18 @@ def main():
             return 1
         print("\n[DRY-RUN] Continuing despite failures...")
     
+    active_session_id = args.session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Pre-capture workflow (persistent SQLite store)
+    if not args.skip_pre_capture:
+        try:
+            from pre_capture import run_pre_capture_workflow
+            base_dir = Path(config.get('pipeline', {}).get('session', {}).get('base_directory', 'dataset/sessions'))
+            run_pre_capture_workflow(session_id=active_session_id, base_dir=base_dir)
+        except Exception as e:
+            print(f"✗ Pre-capture workflow failed: {e}")
+            return 1
+
     # Initialize camera
     if not args.dry_run:
         try:
@@ -175,7 +189,7 @@ def main():
             grid_map=calib.get('grid_map', {}),
             calib_params=calib,
             config=config,
-            session_id=args.session_id,
+            session_id=active_session_id,
         )
         
         summary = orchestrator.run_session()

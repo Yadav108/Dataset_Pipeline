@@ -13,7 +13,7 @@ camera:
   depth_max_m: 0.27    # 22cm + 5cm margin
   sensor_options:
     controls-color-exposure: 156   
-    controls-color-white-balance: 5200  # white balance
+    controls-color-white-balance-auto: false   # white balance
     controls-color-brightness: 2             # Neutral brightness
     controls-color-contrast: 55             # Slightly punchy for tube differentiation
     controls-color-saturation: 46            # Richer colour for tube colour classification

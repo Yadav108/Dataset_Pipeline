@@ -425,7 +425,11 @@ def _select_tube_class(matched_tubes: list[dict]) -> str:
         print("✗ Invalid input. Try again.")
 
 
-def run_pipeline() -> None:
+def run_pipeline(
+    preselected_volume_ml: float | None = None,
+    preselected_class_id: str | None = None,
+    preselected_capture_mode: str | None = None,
+) -> None:
     """Run automated capture pipeline.
     
     Orchestrates volume declaration, session setup, component initialization,
@@ -434,13 +438,18 @@ def run_pipeline() -> None:
     
     # SETUP
     cfg = get_config()
-    volume_ml, matched_tubes = run_volume_gate()
-    capture_mode = run_capture_mode_gate()
+    if preselected_volume_ml is None:
+        volume_ml, matched_tubes = run_volume_gate()
+    else:
+        volume_ml = preselected_volume_ml
+        matched_tubes = [{"class_id": preselected_class_id}] if preselected_class_id else []
+
+    capture_mode = preselected_capture_mode or run_capture_mode_gate()
     
     session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     # Handle class selection — NEW: Interactive prompt
-    class_id = _select_tube_class(matched_tubes)
+    class_id = preselected_class_id or _select_tube_class(matched_tubes)
     
     logger.info(
         f"Session started: {session_id} | class={class_id} | volume={volume_ml}ml"
