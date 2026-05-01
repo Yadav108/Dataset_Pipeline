@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tube Data Manager</title>
+  <style>
+    :root {
+      --bg: #f7f8fc;
+      --card: #ffffff;
+      --border: #d9dce8;
+      --text: #1e2432;
+      --muted: #5f6b85;
+      --primary: #2f5dff;
+      --danger: #c03232;
+      --ok: #177a40;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 16px;
+      display: grid;
+      gap: 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    h1 { margin: 0 0 8px; font-size: 1.5rem; }
+    h2 { margin: 0 0 10px; font-size: 1.05rem; }
+    .muted { color: var(--muted); font-size: 0.92rem; }
+    .grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+    label {
+      display: block;
+      font-size: 0.88rem;
+      font-weight: 600;
+      margin-bottom: 5px;
+    }
+    input, select, textarea, button {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.94rem;
+    }
+    textarea { min-height: 84px; resize: vertical; }
+    button {
+      cursor: pointer;
+      background: #fff;
+    }
+    .btn-primary {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+    }
+    .btn-danger {
+      background: #fff2f2;
+      border-color: #f0b3b3;
+      color: var(--danger);
+    }
+    .row-actions {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px;
+    }
+    .inline-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .msg {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      display: none;
+    }
+    .msg.error { display: block; color: var(--danger); background: #fff2f2; border: 1px solid #f0b3b3; }
+    .msg.success { display: block; color: var(--ok); background: #edf9f1; border: 1px solid #b8e3c9; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+      overflow-x: auto;
+      display: block;
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 8px 6px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f2f4fb; }
+    .chip {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #f9faff;
+      font-size: 0.82rem;
+    }
+    .hidden { display: none; }
+    @media (max-width: 640px) {
+      .container { padding: 10px; }
+      .card { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>Tube Data Manager</h1>
+      <div class="muted">Volume selection, class management, record capture, and export (localStorage).</div>
+    </div>
+
+    <div class="card">
+      <h2>1. Select Volume</h2>
+      <div class="grid">
+        <div>
+          <label for="selectedVolume">Volume</label>
+          <select id="selectedVolume"></select>
+        </div>
+        <div class="inline-actions" style="align-items:end;">
+          <button id="openAddClass" type="button">Add New Class</button>
+        </div>
+      </div>
+      <div id="volumeMessage" class="msg"></div>
+      <div id="classChips" style="margin-top: 10px;"></div>
+    </div>
+
+    <div class="card hidden" id="addClassPanel">
+      <h2>4. Add New Class</h2>
+      <div class="grid">
+        <div>
+          <label for="newClassName">Class Name (UPPERCASE_UNDERSCORE)</label>
+          <input id="newClassName" placeholder="VAC_ORANGE">
+        </div>
+        <div>
+          <label for="familySelect">Tube Family</label>
+          <select id="familySelect">
+            <option>VACUETTE</option>
+            <option>SARSTEDT Regular</option>
+            <option>SARSTEDT Small</option>
+            <option>Custom</option>
+          </select>
+        </div>
+        <div>
+          <label for="volumeMode">Volume Association</label>
+          <select id="volumeMode">
+            <option value="existing">Use Existing Volume</option>
+            <option value="new">Create New Volume</option>
+          </select>
+        </div>
+        <div id="existingVolumeWrap">
+          <label for="existingVolumeSelect">Existing Volume</label>
+          <select id="existingVolumeSelect"></select>
+        </div>
+        <div class="hidden" id="newVolumeWrap">
+          <label for="newVolumeInput">New Volume (e.g., 5ml)</label>
+          <input id="newVolumeInput" placeholder="5ml">
+        </div>
+      </div>
+      <div class="row-actions" style="margin-top: 10px;">
+        <button class="btn-primary" id="saveNewClass" type="button">Save New Class</button>
+        <button id="cancelAddClass" type="button">Cancel</button>
+      </div>
+      <div id="addClassMessage" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>3. Capture / Record Data</h2>
+      <form id="recordForm">
+        <div class="grid">
+          <div>
+            <label for="recordClassName">Tube Class</label>
+            <select id="recordClassName" required></select>
+          </div>
+          <div>
+            <label for="quantityCount">Quantity Count</label>
+            <input id="quantityCount" type="number" min="0" required>
+          </div>
+          <div>
+            <label for="batchNumber">Batch Number (optional)</label>
+            <input id="batchNumber">
+          </div>
+          <div>
+            <label for="expiryDate">Expiry Date (optional)</label>
+            <input id="expiryDate" type="date">
+          </div>
+          <div>
+            <label for="storageLocation">Storage Location (optional)</label>
+            <input id="storageLocation">
+          </div>
+          <div>
+            <label for="notes">Notes / Comments (optional)</label>
+            <textarea id="notes"></textarea>
+          </div>
+        </div>
+        <div class="row-actions" style="margin-top: 10px;">
+          <button class="btn-primary" id="saveRecord" type="submit">Save Record</button>
+          <button id="clearForm" type="button">Clear Form</button>
+        </div>
+      </form>
+      <div id="recordMessage" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>5. Summary + Management</h2>
+      <div class="grid">
+        <div>
+          <label for="filterVolume">Filter by Volume</label>
+          <select id="filterVolume"></select>
+        </div>
+        <div>
+          <label for="filterClass">Filter by Class Name</label>
+          <input id="filterClass" placeholder="e.g. VAC_">
+        </div>
+        <div>
+          <label for="filterFamily">Filter by Family</label>
+          <select id="filterFamily">
+            <option value="">All</option>
+            <option>VACUETTE</option>
+            <option>SARSTEDT Regular</option>
+            <option>SARSTEDT Small</option>
+            <option>Custom</option>
+          </select>
+        </div>
+      </div>
+      <div style="margin-top: 8px;" class="row-actions">
+        <button id="exportJson" type="button">Export JSON</button>
+        <button id="exportCsv" type="button">Export CSV</button>
+      </div>
+
+      <h3 style="margin: 14px 0 8px;">Volume-Class Summary</h3>
+      <table id="summaryTable">
+        <thead>
+          <tr>
+            <th>Volume</th>
+            <th>Family</th>
+            <th>Class</th>
+            <th>Captured Records</th>
+            <th>Last Updated</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+      <h3 style="margin: 14px 0 8px;">Captured Records</h3>
+      <table id="recordsTable">
+        <thead>
+          <tr>
+            <th>Volume</th>
+            <th>Class</th>
+            <th>Family</th>
+            <th>Quantity</th>
+            <th>Batch</th>
+            <th>Expiry</th>
+            <th>Location</th>
+            <th>Notes</th>
+            <th>Updated</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const STORAGE_DB = "tubeClassDb_v1";
+    const STORAGE_RECORDS = "tubeCaptureRecords_v1";
+    const INITIAL_VOLUMES = ["1ml", "1.3ml", "2ml", "3ml", "3.5ml", "4ml", "4.5ml", "10ml"];
+    const INITIAL_CLASSES = [
+      { volume: "4ml", family: "VACUETTE", className: "VAC_PURPLE" },
+      { volume: "4ml", family: "VACUETTE", className: "VAC_RED" },
+      { volume: "4ml", family: "VACUETTE", className: "VAC_GREEN" },
+      { volume: "4ml", family: "VACUETTE", className: "VAC_LIGHTBLUE" },
+      { volume: "4ml", family: "VACUETTE", className: "VAC_GRAY" },
+      { volume: "4ml", family: "VACUETTE", className: "SAR_BLUE" },
+      { volume: "3.5ml", family: "VACUETTE", className: "VAC_GOLD" },
+      { volume: "4.5ml", family: "SARSTEDT Regular", className: "SAR_GREEN" },
+      { volume: "4.5ml", family: "SARSTEDT Regular", className: "SAR_RED" },
+      { volume: "3ml", family: "SARSTEDT Regular", className: "SAR_LAVENDER" },
+      { volume: "10ml", family: "SARSTEDT Regular", className: "SAR_YELLOW" },
+      { volume: "1.3ml", family: "SARSTEDT Small", className: "SAR_SM_ORANGE" },
+      { volume: "1.3ml", family: "SARSTEDT Small", className: "SAR_SM_GRAY" },
+      { volume: "1.3ml", family: "SARSTEDT Small", className: "SAR_SM_GREEN" },
+      { volume: "1.3ml", family: "SARSTEDT Small", className: "SAR_SM_RED" },
+      { volume: "1.3ml", family: "SARSTEDT Small", className: "SAR_SM_TRANSPARENT" },
+      { volume: "1ml", family: "SARSTEDT Small", className: "SAR_SM_TRANSPARENT" }
+    ];
+
+    let db = null;
+    let records = [];
+    let editingKey = null;
+
+    const selectedVolume = document.getElementById("selectedVolume");
+    const existingVolumeSelect = document.getElementById("existingVolumeSelect");
+    const recordClassName = document.getElementById("recordClassName");
+    const classChips = document.getElementById("classChips");
+    const addClassPanel = document.getElementById("addClassPanel");
+    const volumeMode = document.getElementById("volumeMode");
+    const existingVolumeWrap = document.getElementById("existingVolumeWrap");
+    const newVolumeWrap = document.getElementById("newVolumeWrap");
+    const filterVolume = document.getElementById("filterVolume");
+    const filterClass = document.getElementById("filterClass");
+    const filterFamily = document.getElementById("filterFamily");
+    const summaryBody = document.querySelector("#summaryTable tbody");
+    const recordsBody = document.querySelector("#recordsTable tbody");
+
+    function nowIso() {
+      return new Date().toISOString();
+    }
+
+    function showMessage(id, text, isError = false) {
+      const el = document.getElementById(id);
+      el.className = "msg " + (isError ? "error" : "success");
+      el.textContent = text;
+      setTimeout(() => {
+        el.className = "msg";
+        el.textContent = "";
+      }, 3200);
+    }
+
+    function safeParse(jsonString, fallback) {
+      try {
+        return JSON.parse(jsonString);
+      } catch (_err) {
+        return fallback;
+      }
+    }
+
+    function defaultDb() {
+      const stamp = nowIso();
+      return {
+        volumes: [...INITIAL_VOLUMES],
+        classes: INITIAL_CLASSES.map((x) => ({ ...x, createdAt: stamp, updatedAt: stamp }))
+      };
+    }
+
+    function saveDb() {
+      try {
+        localStorage.setItem(STORAGE_DB, JSON.stringify(db));
+      } catch (err) {
+        throw new Error(`Failed to persist class database: ${err.message}`);
+      }
+    }
+
+    function saveRecords() {
+      try {
+        localStorage.setItem(STORAGE_RECORDS, JSON.stringify(records));
+      } catch (err) {
+        throw new Error(`Failed to persist records: ${err.message}`);
+      }
+    }
+
+    function loadData() {
+      try {
+        const loadedDb = safeParse(localStorage.getItem(STORAGE_DB), null);
+        const loadedRecords = safeParse(localStorage.getItem(STORAGE_RECORDS), []);
+        db = loadedDb && Array.isArray(loadedDb.volumes) && Array.isArray(loadedDb.classes) ? loadedDb : defaultDb();
+        records = Array.isArray(loadedRecords) ? loadedRecords : [];
+        saveDb();
+        saveRecords();
+      } catch (err) {
+        throw new Error(`Failed to load persisted data: ${err.message}`);
+      }
+    }
+
+    function sortVolumes(vols) {
+      return [...new Set(vols)].sort((a, b) => parseFloat(a) - parseFloat(b));
+    }
+
+    function renderVolumeOptions() {
+      const prevSelectedVolume = selectedVolume.value;
+      const prevFilterVolume = filterVolume.value;
+      db.volumes = sortVolumes(db.volumes);
+      const options = db.volumes.map((v) => `<option value="${v}">${v}</option>`).join("");
+      selectedVolume.innerHTML = options;
+      existingVolumeSelect.innerHTML = options;
+      filterVolume.innerHTML = `<option value="">All</option>${options}`;
+      selectedVolume.value = db.volumes.includes(prevSelectedVolume) ? prevSelectedVolume : (db.volumes[0] || "");
+      filterVolume.value = db.volumes.includes(prevFilterVolume) ? prevFilterVolume : "";
+    }
+
+    function classesForVolume(volume) {
+      return db.classes
+        .filter((c) => c.volume === volume)
+        .sort((a, b) => a.className.localeCompare(b.className));
+    }
+
+    function renderVolumeClasses() {
+      const vol = selectedVolume.value;
+      const classes = classesForVolume(vol);
+      classChips.innerHTML = classes.length
+        ? classes.map((c) => `<span class="chip">${c.className} (${c.family})</span>`).join("")
+        : "<span class='muted'>No classes for this volume yet.</span>";
+
+      recordClassName.innerHTML = classes.length
+        ? classes.map((c) => `<option value="${c.className}">${c.className}</option>`).join("")
+        : `<option value="">No class available</option>`;
+    }
+
+    function normalizeFamily(value) {
+      if (value === "SARSTEDT Regular" || value === "SARSTEDT Small" || value === "VACUETTE" || value === "Custom") {
+        return value;
+      }
+      return "Custom";
+    }
+
+    function validateClassName(name) {
+      return /^[A-Z][A-Z0-9_]*$/.test(name);
+    }
+
+    function classMeta(volume, className) {
+      return db.classes.find((c) => c.volume === volume && c.className === className) || null;
+    }
+
+    function recordKey(volume, className) {
+      return `${volume}::${className}`;
+    }
+
+    function saveRecord(event) {
+      event.preventDefault();
+      const volume = selectedVolume.value;
+      const className = recordClassName.value;
+      const qty = Number(document.getElementById("quantityCount").value);
+      const batchNumber = document.getElementById("batchNumber").value.trim();
+      const expiryDate = document.getElementById("expiryDate").value;
+      const storageLocation = document.getElementById("storageLocation").value.trim();
+      const notes = document.getElementById("notes").value.trim();
+
+      if (!volume || !className) {
+        showMessage("recordMessage", "Select a valid volume and class.", true);
+        return;
+      }
+      if (!Number.isInteger(qty) || qty < 0) {
+        showMessage("recordMessage", "Quantity must be a non-negative integer.", true);
+        return;
+      }
+
+      const key = recordKey(volume, className);
+      const duplicate = records.some((r) => recordKey(r.volume, r.className) === key);
+      if (!editingKey && duplicate) {
+        showMessage("recordMessage", "Duplicate entry blocked: this volume-class record already exists.", true);
+        return;
+      }
+      if (editingKey && editingKey !== key && duplicate) {
+        showMessage("recordMessage", "Cannot change to this class: record already exists.", true);
+        return;
+      }
+
+      const meta = classMeta(volume, className);
+      if (!meta) {
+        showMessage("recordMessage", "Class metadata missing. Add class first.", true);
+        return;
+      }
+
+      const payload = {
+        id: key,
+        volume,
+        className,
+        family: meta.family,
+        quantityCount: qty,
+        batchNumber,
+        expiryDate,
+        storageLocation,
+        notes,
+        createdAt: nowIso(),
+        updatedAt: nowIso()
+      };
+
+      if (editingKey) {
+        const idx = records.findIndex((r) => r.id === editingKey);
+        if (idx < 0) {
+          showMessage("recordMessage", "Edit target not found.", true);
+          return;
+        }
+        payload.createdAt = records[idx].createdAt || payload.createdAt;
+        records[idx] = payload;
+      } else {
+        records.push(payload);
+      }
+      try {
+        saveRecords();
+        clearForm();
+        renderAll();
+        showMessage("recordMessage", "Record saved successfully.");
+      } catch (err) {
+        showMessage("recordMessage", err.message, true);
+      }
+    }
+
+    function clearForm() {
+      editingKey = null;
+      document.getElementById("recordForm").reset();
+      document.getElementById("saveRecord").textContent = "Save Record";
+      renderVolumeClasses();
+    }
+
+    function startAddClass() {
+      addClassPanel.classList.remove("hidden");
+    }
+
+    function cancelAddClass() {
+      addClassPanel.classList.add("hidden");
+      document.getElementById("newClassName").value = "";
+      document.getElementById("newVolumeInput").value = "";
+      volumeMode.value = "existing";
+      syncVolumeMode();
+    }
+
+    function syncVolumeMode() {
+      const isNew = volumeMode.value === "new";
+      existingVolumeWrap.classList.toggle("hidden", isNew);
+      newVolumeWrap.classList.toggle("hidden", !isNew);
+    }
+
+    function saveNewClass() {
+      const className = document.getElementById("newClassName").value.trim();
+      const family = normalizeFamily(document.getElementById("familySelect").value);
+      const chosenVolume = volumeMode.value === "new"
+        ? document.getElementById("newVolumeInput").value.trim()
+        : existingVolumeSelect.value;
+
+      if (!validateClassName(className)) {
+        showMessage("addClassMessage", "Class name must be uppercase with underscores (e.g., VAC_ORANGE).", true);
+        return;
+      }
+      if (!/^\d+(\.\d+)?ml$/.test(chosenVolume)) {
+        showMessage("addClassMessage", "Volume format must be like 1ml, 1.3ml, 10ml.", true);
+        return;
+      }
+
+      const alreadyExists = db.classes.some((c) => c.volume === chosenVolume && c.className === className);
+      if (alreadyExists) {
+        showMessage("addClassMessage", "This class already exists for the selected volume.", true);
+        return;
+      }
+
+      if (!db.volumes.includes(chosenVolume)) {
+        db.volumes.push(chosenVolume);
+      }
+
+      db.classes.push({
+        volume: chosenVolume,
+        family,
+        className,
+        createdAt: nowIso(),
+        updatedAt: nowIso()
+      });
+      try {
+        saveDb();
+        renderAll();
+        selectedVolume.value = chosenVolume;
+        renderVolumeClasses();
+        showMessage("volumeMessage", `Class ${className} added to ${chosenVolume} and is ready for selection.`);
+        cancelAddClass();
+      } catch (err) {
+        showMessage("addClassMessage", err.message, true);
+      }
+    }
+
+    function filteredRows(rows) {
+      const fv = filterVolume.value;
+      const fc = filterClass.value.trim().toUpperCase();
+      const ff = filterFamily.value;
+      return rows.filter((r) => {
+        const okVolume = !fv || r.volume === fv;
+        const okClass = !fc || r.className.toUpperCase().includes(fc);
+        const okFamily = !ff || r.family === ff;
+        return okVolume && okClass && okFamily;
+      });
+    }
+
+    function summaryRows() {
+      const rows = [];
+      for (const v of db.volumes) {
+        const classes = classesForVolume(v);
+        if (!classes.length) {
+          rows.push({ volume: v, family: "-", className: "(No classes)", count: 0, updatedAt: "-" });
+          continue;
+        }
+        for (const cls of classes) {
+          const rec = records.find((r) => r.volume === v && r.className === cls.className);
+          rows.push({
+            volume: v,
+            family: cls.family,
+            className: cls.className,
+            count: rec ? 1 : 0,
+            updatedAt: rec ? rec.updatedAt : cls.updatedAt
+          });
+        }
+      }
+      return rows;
+    }
+
+    function renderSummary() {
+      const rows = filteredRows(summaryRows());
+      summaryBody.innerHTML = rows.map((r) => `
+        <tr>
+          <td>${r.volume}</td>
+          <td>${r.family}</td>
+          <td>${r.className}</td>
+          <td>${r.count}</td>
+          <td>${r.updatedAt === "-" ? "-" : new Date(r.updatedAt).toLocaleString()}</td>
+        </tr>
+      `).join("");
+    }
+
+    function renderRecords() {
+      const rows = filteredRows(records.map((r) => ({
+        volume: r.volume,
+        family: r.family,
+        className: r.className,
+        quantityCount: r.quantityCount,
+        batchNumber: r.batchNumber || "",
+        expiryDate: r.expiryDate || "",
+        storageLocation: r.storageLocation || "",
+        notes: r.notes || "",
+        updatedAt: r.updatedAt,
+        id: r.id
+      })));
+      recordsBody.innerHTML = rows.map((r) => `
+        <tr>
+          <td>${r.volume}</td>
+          <td>${r.className}</td>
+          <td>${r.family}</td>
+          <td>${r.quantityCount}</td>
+          <td>${r.batchNumber}</td>
+          <td>${r.expiryDate}</td>
+          <td>${r.storageLocation}</td>
+          <td>${r.notes}</td>
+          <td>${new Date(r.updatedAt).toLocaleString()}</td>
+          <td>
+            <div class="inline-actions">
+              <button type="button" data-edit="${r.id}">Edit</button>
+              <button type="button" data-delete="${r.id}" class="btn-danger">Delete</button>
+            </div>
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    function editRecord(id) {
+      const rec = records.find((r) => r.id === id);
+      if (!rec) {
+        showMessage("recordMessage", "Record not found.", true);
+        return;
+      }
+      editingKey = id;
+      selectedVolume.value = rec.volume;
+      renderVolumeClasses();
+      recordClassName.value = rec.className;
+      document.getElementById("quantityCount").value = rec.quantityCount;
+      document.getElementById("batchNumber").value = rec.batchNumber || "";
+      document.getElementById("expiryDate").value = rec.expiryDate || "";
+      document.getElementById("storageLocation").value = rec.storageLocation || "";
+      document.getElementById("notes").value = rec.notes || "";
+      document.getElementById("saveRecord").textContent = "Update Record";
+      showMessage("recordMessage", "Loaded record for editing.");
+    }
+
+    function deleteRecord(id) {
+      const idx = records.findIndex((r) => r.id === id);
+      if (idx < 0) {
+        showMessage("recordMessage", "Record not found for deletion.", true);
+        return;
+      }
+      try {
+        records.splice(idx, 1);
+        saveRecords();
+        if (editingKey === id) {
+          clearForm();
+        }
+        renderAll();
+        showMessage("recordMessage", "Record deleted.");
+      } catch (err) {
+        showMessage("recordMessage", err.message, true);
+      }
+    }
+
+    function handleRecordsActions(event) {
+      const editId = event.target.getAttribute("data-edit");
+      const deleteId = event.target.getAttribute("data-delete");
+      if (editId) editRecord(editId);
+      if (deleteId && confirm("Delete this record?")) deleteRecord(deleteId);
+    }
+
+    function exportJson() {
+      try {
+        const blob = new Blob([JSON.stringify({ db, records, exportedAt: nowIso() }, null, 2)], { type: "application/json" });
+        downloadBlob(blob, `tube_data_export_${Date.now()}.json`);
+        showMessage("volumeMessage", "JSON export generated.");
+      } catch (err) {
+        showMessage("volumeMessage", `JSON export failed: ${err.message}`, true);
+      }
+    }
+
+    function exportCsv() {
+      try {
+        const headers = ["volume", "className", "family", "quantityCount", "batchNumber", "expiryDate", "storageLocation", "notes", "updatedAt"];
+        const escape = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+        const lines = [headers.join(",")];
+        for (const r of records) {
+          lines.push(headers.map((h) => escape(r[h])).join(","));
+        }
+        const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+        downloadBlob(blob, `tube_records_${Date.now()}.csv`);
+        showMessage("volumeMessage", "CSV export generated.");
+      } catch (err) {
+        showMessage("volumeMessage", `CSV export failed: ${err.message}`, true);
+      }
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function renderAll() {
+      renderVolumeOptions();
+      renderVolumeClasses();
+      renderSummary();
+      renderRecords();
+    }
+
+    function registerEvents() {
+      selectedVolume.addEventListener("change", () => {
+        renderVolumeClasses();
+      });
+      document.getElementById("recordForm").addEventListener("submit", saveRecord);
+      document.getElementById("clearForm").addEventListener("click", clearForm);
+      document.getElementById("openAddClass").addEventListener("click", startAddClass);
+      document.getElementById("cancelAddClass").addEventListener("click", cancelAddClass);
+      document.getElementById("saveNewClass").addEventListener("click", saveNewClass);
+      volumeMode.addEventListener("change", syncVolumeMode);
+      filterVolume.addEventListener("change", () => { renderSummary(); renderRecords(); });
+      filterClass.addEventListener("input", () => { renderSummary(); renderRecords(); });
+      filterFamily.addEventListener("change", () => { renderSummary(); renderRecords(); });
+      recordsBody.addEventListener("click", handleRecordsActions);
+      document.getElementById("exportJson").addEventListener("click", exportJson);
+      document.getElementById("exportCsv").addEventListener("click", exportCsv);
+    }
+
+    (function init() {
+      try {
+        loadData();
+        registerEvents();
+        syncVolumeMode();
+        renderAll();
+      } catch (err) {
+        showMessage("volumeMessage", `Initialization failed: ${err.message}`, true);
+      }
+    })();
+  </script>
+</body>
+</html>
