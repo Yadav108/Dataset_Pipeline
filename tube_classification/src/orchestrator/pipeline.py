@@ -7,6 +7,12 @@ import numpy as np
 from loguru import logger
 from config.parser import get_config
 from src.acquisition.streamer import RealSenseStreamer
+from src.acquisition.fill_level_detector import (
+    FillLevelDetector,
+    FillLevelConfig,
+    FillLevelResult,
+    FillLevel,
+)
 from src.acquisition.stability_detector import DepthStabilityDetector
 from src.acquisition.distance_calibrator import DistanceCalibrator
 from src.acquisition.volume_gate import run_volume_gate
@@ -133,6 +139,7 @@ def _process_roi(
     calibration_result: dict | None = None,
     orientation: str = 'side',
     is_inverted: bool = False,
+    fill_level_result: FillLevelResult | None = None,
 ) -> tuple[bool, float | None]:
     """Process a single ROI through segmentation, annotation, and cleaning.
     
@@ -245,7 +252,13 @@ def _process_roi(
         sam_iou_score=sam_iou_score,
         calibration_metadata=calibration_metadata,
     )
-    if quality_metrics is not None:
+    if fill_level_result is not None:
+        metadata["fill_level"] = {
+            "level": fill_level_result.level.value,
+            "confidence": fill_level_result.confidence,
+            "boundary_ratio": fill_level_result.boundary_ratio,
+        }
+
         metadata["quality_metrics"] = {
             "image_id": image_id,
             "class_id": class_id,
@@ -501,6 +514,10 @@ def run_pipeline(
     bbox_filter = BBoxQualityFilter()
     background_remover = BackgroundRemover()
     
+    # Initialize FillLevelDetector
+    fill_level_detector = FillLevelDetector(FillLevelConfig())
+    logger.info("FillLevelDetector initialized.")
+    
     # NEW: Preprocessing pipeline
     preprocessing_pipeline = PreprocessingPipeline()
     logger.info(
@@ -560,16 +577,34 @@ def run_pipeline(
             # SKIP STABILITY CHECK - capture immediately
             logger.debug(f"Frame {frame_count}: Skipped stability check, proceeding to ROI extraction")
             
-            # Extract ROI(s) — mode-dependent
-            bboxes = extract_bboxes_for_mode(capture_mode, roi_extractor, depth_frame)
-            frame_orientation = roi_extractor.orientation
-            frame_is_inverted = roi_extractor.is_inverted
-            logger.debug(
-                f"Frame {frame_count}: orientation={frame_orientation}, "
-                f"is_inverted={frame_is_inverted}"
-            )
-
-            if not bboxes:
+# Extract ROI(s) — mode-dependent
+        bboxes = extract_bboxes_for_mode(capture_mode, roi_extractor, depth_frame)
+        frame_orientation = roi_extractor.orientation
+        frame_is_inverted = roi_extractor.is_inverted
+        logger.debug(
+            f"Frame {frame_count}: orientation={frame_orientation}, "
+            f"is_inverted={frame_is_inverted}"
+        )
+        
+        # Fill level detection (single_side mode only)
+        fill_level_results: dict[int, FillLevelResult] = {}
+        if capture_mode == "single_side" and bboxes:
+            for idx, bbox in enumerate(bboxes):
+                x, y, w, h = bbox
+                roi_crop = rgb_frame[y:y+h, x:x+w]
+                try:
+                    result = fill_level_detector.detect(roi_crop)
+                    fill_level_results[idx] = result
+                    logger.info(
+                        f"[fill_level] bbox={idx} → "
+                        f"{result.level.value} "
+                        f"(confidence={result.confidence}, "
+                        f"boundary_ratio={result.boundary_ratio:.3f})"
+                    )
+                except Exception as e:
+                    logger.warning(f"[fill_level] Detection failed for bbox {idx}: {e}")
+        
+        if not bboxes:
                 rejected_roi += 1
                 last_rejection = "NO_ROI"
                 rejection_frame_count = 0
@@ -602,6 +637,7 @@ def run_pipeline(
             first_bbox_for_preview = bboxes[0]  # For preview overlay
             
             for bbox in bboxes:
+fill_result = fill_level_results.get(bboxes.index(bbox))
                 success, iou_score = _process_roi(
                     rgb_frame, depth_frame, bbox,
                     class_id, volume_ml, session_id,
@@ -612,6 +648,7 @@ def run_pipeline(
                     calibration_result=calibration_result,
                     orientation=frame_orientation,
                     is_inverted=frame_is_inverted,
+                    fill_level_result=fill_result,
                 )
                 
                 if success:

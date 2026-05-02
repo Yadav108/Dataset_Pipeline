@@ -24,6 +24,7 @@ camera:
   depth_postprocess:
     enabled: true
     spatial_enabled: true
+    controls-exposure-auto: false
     spatial_alpha: 0.5
     spatial_delta: 20
     spatial_magnitude: 2
