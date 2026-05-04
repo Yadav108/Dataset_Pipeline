@@ -141,6 +141,9 @@ depth_mask_refiner:
   enabled: true
   depth_band_tolerance_mm: 40.0
   depth_sample_region_ratio: 0.30
+  zero_depth_support_kernel_size: 9
+  zero_depth_fallback_min_keep_ratio: 0.55
+  zero_depth_fallback_min_zero_ratio: 0.35
   holder_height_mm: 120.0
   holder_width_mm: 40.0
   holder_x_pad_ratio: 0.20
