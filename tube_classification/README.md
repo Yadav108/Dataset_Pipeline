@@ -26,7 +26,23 @@ This project provides a complete pipeline for:
 
 ---
 
-## 🚀 Quick Start
+## 🏗️ Project Organization
+
+This project follows industrial-grade structure with clear separation of concerns:
+
+- **src/** — Production code (capture, annotation, cleaning, export)
+- **tests/** — Test suite with active tests + preserved legacy scripts
+- **docs/** — Organized documentation (guides, troubleshooting, archive)
+- **config/** — Configuration files
+- **dataset/**, **models/**, **logs/** — Data and artifacts
+
+**Recent cleanup (May 2026):**
+- Documentation reorganized into [docs/guides/](docs/guides/), [docs/troubleshooting/](docs/troubleshooting/), [docs/archive/](docs/archive/)
+- Legacy test scripts moved to [tests/legacy/](tests/legacy/) (preserved, not deleted)
+- Root directory cleaned: removed debug artifacts, standardized for production workflows
+- Python requirements cleaned and pinned to compatible versions (>=3.10,<3.13)
+
+---
 
 ### Prerequisites
 - **Camera**: Intel RealSense D435i
@@ -83,11 +99,17 @@ python main.py
 ```
 
 The pipeline will:
+- Run pre-capture data entry (volume/class records) with SQLite persistence
 - Wait for stable depth frames (4 consecutive stable frames)
 - Extract ROI containing tube
 - Run MobileSAM segmentation
 - Apply quality filters (blur, coverage, IoU)
 - Export annotated image + mask + metadata
+
+To skip pre-capture data entry:
+```bash
+python capture.py --skip-pre-capture
+```
 
 ### Capture with Custom Config
 Edit `config/config.yaml` before running:
@@ -111,6 +133,9 @@ pipeline:
 python -m src.export.export_coco    # COCO format
 python -m src.export.export_yolo    # YOLO format
 ```
+
+### Tube Data Manager (Volume/Class Capture)
+Open `tube_data_manager.html` in a browser to manage tube classes and capture per-class quantity/batch/expiry/location notes with local persistent storage.
 
 ---
 
@@ -149,9 +174,28 @@ tube_classification/
 │   └── exports/                     # COCO/YOLO datasets
 ├── models/
 │   └── mobile_sam.pt               # (Download required)
-├── requirements.txt                 # Python dependencies
+├── docs/                            # Complete documentation
+│   ├── guides/                      # Setup & how-to guides
+│   ├── troubleshooting/             # Known issues & solutions
+│   └── archive/                     # Historical docs
+├── tests/                           # Test suite
+│   ├── unit/legacy/                 # Legacy test scripts (preserved)
+│   └── *.py                        # Active pytest suite
+├── requirements.txt                 # Python dependencies (>=3.10,<3.13)
 └── README.md                        # This file
 ```
+
+### Documentation Organization
+- **Start here:** [README.md](README.md) + [QUICK_START.md](QUICK_START.md)
+- **Setup guides:** [docs/guides/](docs/guides/)
+- **Configuration:** [docs/PREPROCESSING_CONFIG_GUIDE.md](docs/PREPROCESSING_CONFIG_GUIDE.md)
+- **Troubleshooting:** [docs/troubleshooting/](docs/troubleshooting/)
+- **Historical/milestones:** [docs/archive/](docs/archive/)
+
+### Test Suite
+- **Run tests:** `pytest` (active suite in `tests/`)
+- **Documentation:** [tests/README.md](tests/README.md)
+- **Legacy scripts:** [tests/legacy/](tests/legacy/) (reference/migration)
 
 ---
 

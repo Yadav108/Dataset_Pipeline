@@ -1,7 +1,52 @@
+# Large data files - don't commit to git
+dataset/
+models/*.pt
+*.npy
+*.npz
 
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
 __pycache__/
 *.pyc
-venv/
-data/
-dataset/
-debug_*.png
+*.pyo
+*.pyd
+.Python
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Test cache
+.pytest_cache/
+.coverage
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.git.backup/
+dataset.zip
+*.zip
+
+../.git.backup/
+../.claude/
+../Industrial_Project_brain/
