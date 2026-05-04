@@ -5,6 +5,8 @@ import yaml
 from loguru import logger
 from pydantic import BaseModel, model_validator
 
+from src.processing.depth_mask_refiner import DepthMaskRefinerConfig
+
 
 class CameraConfig(BaseModel):
     width: Literal[640, 848, 1280]
@@ -159,6 +161,7 @@ class AppConfig(BaseModel):
     storage: StorageConfig
     pipeline: PipelineConfig
     preprocessing: PreprocessingConfig = PreprocessingConfig()
+    depth_mask_refiner: DepthMaskRefinerConfig = DepthMaskRefinerConfig()
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"

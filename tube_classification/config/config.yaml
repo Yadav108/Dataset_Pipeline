@@ -136,3 +136,15 @@ preprocessing:
     rgb_normalize: true
     preserve_invalid: true
     max_processing_time_ms: 500.0
+
+depth_mask_refiner:
+  enabled: true
+  depth_band_tolerance_mm: 40.0
+  depth_sample_region_ratio: 0.30
+  holder_height_mm: 120.0
+  holder_width_mm: 40.0
+  holder_x_pad_ratio: 0.20
+  morph_closing_kernel_size: 5
+  morph_closing_iterations: 2
+  min_contour_area_px: 500
+  apply_only_orientations: ["side", "angled"]

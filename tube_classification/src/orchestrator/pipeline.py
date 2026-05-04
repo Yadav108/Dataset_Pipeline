@@ -8,8 +8,6 @@ from loguru import logger
 from config.parser import get_config
 from src.acquisition.streamer import RealSenseStreamer
 from src.acquisition.fill_level_detector import (
-    FillLevelDetector,
-    FillLevelConfig,
     FillLevelResult,
     FillLevel,
 )
@@ -119,6 +117,29 @@ def _draw_preview_overlays(
     return frame
 
 
+def _prompt_fill_level_declaration() -> FillLevelResult | None:
+    """Prompt operator to declare fill level before capture."""
+    while True:
+        prompt = "Declare fill level [F]ull / [H]alf / [E]mpty / [Q]uit: "
+        try:
+            import msvcrt
+
+            print(prompt, end="", flush=True)
+            user_input = msvcrt.getwch().strip().lower()
+            print(user_input.upper())
+        except Exception:
+            user_input = input(prompt).strip().lower()
+        if user_input == "f":
+            return FillLevelResult(level=FillLevel.FULL, confidence="operator_declared", boundary_ratio=0.0)
+        if user_input == "h":
+            return FillLevelResult(level=FillLevel.HALF, confidence="operator_declared", boundary_ratio=0.5)
+        if user_input == "e":
+            return FillLevelResult(level=FillLevel.EMPTY, confidence="operator_declared", boundary_ratio=1.0)
+        if user_input == "q":
+            return None
+        print("Invalid input. Enter F, H, E, or Q.")
+
+
 def _process_roi(
     rgb_frame: np.ndarray,
     depth_frame: np.ndarray,
@@ -140,6 +161,7 @@ def _process_roi(
     orientation: str = 'side',
     is_inverted: bool = False,
     fill_level_result: FillLevelResult | None = None,
+    intrinsics: object = None,
 ) -> tuple[bool, float | None]:
     """Process a single ROI through segmentation, annotation, and cleaning.
     
@@ -187,7 +209,90 @@ def _process_roi(
         return (False, None)
     
     mask, sam_iou_score = segment_result
-    
+
+    # --- Depth mask refinement (Track A) ---
+    median_depth_mm: float | None = None
+    if (
+        cfg.depth_mask_refiner.enabled
+        and orientation in cfg.depth_mask_refiner.apply_only_orientations
+        and depth_frame is not None
+        and intrinsics is not None
+    ):
+        from src.processing.depth_mask_refiner import refine_mask
+        original_mask = mask.copy()
+        refined_mask, median_depth_mm = refine_mask(
+            mask=mask,
+            depth_frame=depth_frame,
+            bbox=bbox,
+            intrinsics=intrinsics,
+            config=cfg.depth_mask_refiner,
+            orientation=orientation,
+        )
+
+        # Guard against destructive refinement collapse (thin core-only masks).
+        orig_area = float(np.count_nonzero(original_mask))
+        ref_area = float(np.count_nonzero(refined_mask))
+        area_ratio = ref_area / max(orig_area, 1.0)
+
+        orig_rows = np.where(original_mask.any(axis=1))[0]
+        ref_rows = np.where(refined_mask.any(axis=1))[0]
+        orig_cols = np.where(original_mask.any(axis=0))[0]
+        ref_cols = np.where(refined_mask.any(axis=0))[0]
+
+        orig_h = int(orig_rows[-1] - orig_rows[0] + 1) if len(orig_rows) > 0 else 0
+        ref_h = int(ref_rows[-1] - ref_rows[0] + 1) if len(ref_rows) > 0 else 0
+        orig_w = int(orig_cols[-1] - orig_cols[0] + 1) if len(orig_cols) > 0 else 0
+        ref_w = int(ref_cols[-1] - ref_cols[0] + 1) if len(ref_cols) > 0 else 0
+
+        bad_shrink = area_ratio < 0.75
+        bad_height = (orig_h >= 60) and (ref_h < int(0.70 * orig_h))
+        bad_width = (orig_w >= 35) and (ref_w < int(0.55 * orig_w))
+
+        if bad_shrink or bad_height or bad_width:
+            logger.debug(
+                f"Depth mask refinement rejected: area_ratio={area_ratio:.2f}, "
+                f"height={orig_h}->{ref_h}, width={orig_w}->{ref_w}"
+            )
+        else:
+            mask = refined_mask
+    # --- End depth mask refinement ---
+
+    # --- Instance metadata path (Track C, single-tube) ---
+    if cfg.depth_mask_refiner.enabled:
+        from src.annotation.metadata_builder import build_image_metadata
+
+        instance_dict = {
+            "instance_id": f"{image_id}_tube_0",
+            "class_id": class_id,
+            "volume_ml": volume_ml,
+            "mask_file": f"{image_id}_mask_0.png",
+            "mask": mask,
+            "bbox": bbox,
+            "rotation_angle_deg": 0.0,
+            "occlusion_percent": 0.0,
+            "distance_m": float(median_depth_mm / 1000.0)
+                          if median_depth_mm is not None else None,
+            "sam_iou_score": sam_iou_score if sam_iou_score is not None else None,
+        }
+        if fill_level_result is not None:
+            instance_dict["fill_level"] = {
+                "level": fill_level_result.level.value,
+                "confidence": fill_level_result.confidence,
+                "boundary_ratio": float(fill_level_result.boundary_ratio),
+            }
+
+        image_meta = build_image_metadata(
+            image_id=image_id,
+            rgb_image=rgb_frame,
+            instances=[instance_dict],
+            capture_mode=orientation,
+            lighting_condition="unknown",
+        )
+
+        session_dir = Path(cfg.storage.root_dir) / "raw" / class_id / session_id
+        writer.write_image_metadata(image_meta, session_dir)
+    # --- End instance metadata path ---
+
     # NEW: Refine mask with depth geometry if available
     if preprocessing_pipeline and preprocessing_pipeline.mask_refinement_enabled:
         original_mask = mask.copy()
@@ -457,6 +562,11 @@ def run_pipeline(
         volume_ml = preselected_volume_ml
         matched_tubes = [{"class_id": preselected_class_id}] if preselected_class_id else []
 
+    session_fill_level_result = _prompt_fill_level_declaration()
+    if session_fill_level_result is None:
+        logger.info("Operator canceled before capture-mode selection.")
+        return
+
     capture_mode = preselected_capture_mode or run_capture_mode_gate()
     
     session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -466,6 +576,11 @@ def run_pipeline(
     
     logger.info(
         f"Session started: {session_id} | class={class_id} | volume={volume_ml}ml"
+    )
+    logger.info(
+        f"Fill level declared for session: {session_fill_level_result.level.value} "
+        f"(confidence={session_fill_level_result.confidence}, "
+        f"boundary_ratio={session_fill_level_result.boundary_ratio:.3f})"
     )
     
     # COUNT EXISTING IMAGES FOR THIS CLASS (crash recovery)
@@ -513,10 +628,6 @@ def run_pipeline(
     duplicate_remover = DuplicateRemover()
     bbox_filter = BBoxQualityFilter()
     background_remover = BackgroundRemover()
-    
-    # Initialize FillLevelDetector
-    fill_level_detector = FillLevelDetector(FillLevelConfig())
-    logger.info("FillLevelDetector initialized.")
     
     # NEW: Preprocessing pipeline
     preprocessing_pipeline = PreprocessingPipeline()
@@ -577,34 +688,16 @@ def run_pipeline(
             # SKIP STABILITY CHECK - capture immediately
             logger.debug(f"Frame {frame_count}: Skipped stability check, proceeding to ROI extraction")
             
-# Extract ROI(s) — mode-dependent
-        bboxes = extract_bboxes_for_mode(capture_mode, roi_extractor, depth_frame)
-        frame_orientation = roi_extractor.orientation
-        frame_is_inverted = roi_extractor.is_inverted
-        logger.debug(
-            f"Frame {frame_count}: orientation={frame_orientation}, "
-            f"is_inverted={frame_is_inverted}"
-        )
+            # Extract ROI(s) — mode-dependent
+            bboxes = extract_bboxes_for_mode(capture_mode, roi_extractor, depth_frame)
+            frame_orientation = roi_extractor.orientation
+            frame_is_inverted = roi_extractor.is_inverted
+            logger.debug(
+                f"Frame {frame_count}: orientation={frame_orientation}, "
+                f"is_inverted={frame_is_inverted}"
+            )
         
-        # Fill level detection (single_side mode only)
-        fill_level_results: dict[int, FillLevelResult] = {}
-        if capture_mode == "single_side" and bboxes:
-            for idx, bbox in enumerate(bboxes):
-                x, y, w, h = bbox
-                roi_crop = rgb_frame[y:y+h, x:x+w]
-                try:
-                    result = fill_level_detector.detect(roi_crop)
-                    fill_level_results[idx] = result
-                    logger.info(
-                        f"[fill_level] bbox={idx} → "
-                        f"{result.level.value} "
-                        f"(confidence={result.confidence}, "
-                        f"boundary_ratio={result.boundary_ratio:.3f})"
-                    )
-                except Exception as e:
-                    logger.warning(f"[fill_level] Detection failed for bbox {idx}: {e}")
-        
-        if not bboxes:
+            if not bboxes:
                 rejected_roi += 1
                 last_rejection = "NO_ROI"
                 rejection_frame_count = 0
@@ -636,8 +729,7 @@ def run_pipeline(
             rois_captured_this_frame = 0
             first_bbox_for_preview = bboxes[0]  # For preview overlay
             
-            for bbox in bboxes:
-fill_result = fill_level_results.get(bboxes.index(bbox))
+            for idx, bbox in enumerate(bboxes):
                 success, iou_score = _process_roi(
                     rgb_frame, depth_frame, bbox,
                     class_id, volume_ml, session_id,
@@ -648,7 +740,8 @@ fill_result = fill_level_results.get(bboxes.index(bbox))
                     calibration_result=calibration_result,
                     orientation=frame_orientation,
                     is_inverted=frame_is_inverted,
-                    fill_level_result=fill_result,
+                    fill_level_result=session_fill_level_result,
+                    intrinsics=streamer,
                 )
                 
                 if success:
