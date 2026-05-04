@@ -3,7 +3,6 @@ import cv2
 import json
 from pathlib import Path
 
-from PIL import Image
 from loguru import logger
 from config.parser import get_config
 
@@ -93,8 +92,6 @@ class AnnotationWriter:
         )
         depth_png_path = raw_dir / f"{image_id}_depth.png"
         cv2.imwrite(str(depth_png_path), depth_scaled)
-        depth16_png_path = raw_dir / f"{image_id}_depth16.png"
-        Image.fromarray(depth_frame.astype(np.uint16), mode="I;16").save(str(depth16_png_path))
         
         # 3. Write depth NPY (raw)
         depth_npy_path = raw_dir / f"{image_id}_depth.npy"
@@ -123,3 +120,38 @@ class AnnotationWriter:
         logger.info(
             f"Annotation written: {image_id} → class={class_id} session={session_id}"
         )
+
+    def write_image_metadata(
+        self,
+        image_metadata: "ImageMetadata",
+        session_dir: Path,
+    ) -> Path:
+        """Serialize an ImageMetadata record to a JSON file in session_dir.
+
+        Args:
+            image_metadata: Validated ImageMetadata instance to write.
+            session_dir: Destination directory; created if it does not exist.
+
+        Returns:
+            Path of the written file.
+
+        Raises:
+            OSError: If the file cannot be written.
+        """
+        from src.annotation.metadata_builder import ImageMetadata  # noqa: F811
+
+        session_dir.mkdir(parents=True, exist_ok=True)
+        out_path = session_dir / f"{image_metadata.image_id}_metadata.json"
+
+        try:
+            data = image_metadata.model_dump()
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.error(f"Failed to write image metadata to {out_path}: {exc}")
+            raise
+
+        logger.debug(
+            f"Wrote metadata: {out_path} ({len(image_metadata.instances)} instances)"
+        )
+        return out_path

@@ -792,16 +792,20 @@ class SAMSegmentor:
             pre_depth_area = cv2.countNonZero(mask)
             depth_filtered = self.filter_mask_by_tube_depth(mask, depth_frame, (x, y, w, h))
             post_depth_area = cv2.countNonZero(depth_filtered)
-            if pre_depth_area > 0 and post_depth_area >= int(0.30 * pre_depth_area):
+            # Side/angled captures of transparent tubes can lose outer walls in depth,
+            # so require stronger area retention before accepting depth intersection.
+            min_depth_keep_ratio = 0.50 if orientation in {"side", "angled"} else 0.30
+            if pre_depth_area > 0 and post_depth_area >= int(min_depth_keep_ratio * pre_depth_area):
                 logger.debug(
                     f"Depth filter applied: {pre_depth_area} → {post_depth_area}px² "
                     f"({pre_depth_area - post_depth_area}px removed)"
                 )
                 mask = depth_filtered
             else:
-                # Depth sample unreliable (transparent cap / no depth data) — skip filter
+                # Depth sample unreliable (transparent cap/body / no depth data) — skip filter
                 logger.debug(
-                    f"Depth filter skipped: would reduce {pre_depth_area} → {post_depth_area}px² (>70%)"
+                    f"Depth filter skipped: would reduce {pre_depth_area} → {post_depth_area}px² "
+                    f"(keep<{min_depth_keep_ratio:.2f})"
                 )
 
         # ─────────────────────────────────────────────────────────────
@@ -810,16 +814,35 @@ class SAMSegmentor:
         pre_comp_area = cv2.countNonZero(mask)
         comp_filtered = self.keep_tube_component(mask, orientation)
         post_comp_area = cv2.countNonZero(comp_filtered)
-        if pre_comp_area > 0 and post_comp_area >= int(0.35 * pre_comp_area):
-            if post_comp_area < pre_comp_area:
+        min_component_keep_ratio = 0.50 if orientation in {"side", "angled"} else 0.35
+        if pre_comp_area > 0 and post_comp_area >= int(min_component_keep_ratio * pre_comp_area):
+            pre_rows = np.where(mask.any(axis=1))[0]
+            pre_cols = np.where(mask.any(axis=0))[0]
+            post_rows = np.where(comp_filtered.any(axis=1))[0]
+            post_cols = np.where(comp_filtered.any(axis=0))[0]
+            pre_h = int(pre_rows[-1] - pre_rows[0] + 1) if len(pre_rows) > 0 else 0
+            pre_w = int(pre_cols[-1] - pre_cols[0] + 1) if len(pre_cols) > 0 else 0
+            post_h = int(post_rows[-1] - post_rows[0] + 1) if len(post_rows) > 0 else 0
+            post_w = int(post_cols[-1] - post_cols[0] + 1) if len(post_cols) > 0 else 0
+
+            # Prevent component isolation from collapsing side-view masks into a thin core.
+            bad_height = (pre_h >= 70) and (post_h < int(0.70 * pre_h))
+            bad_width = (pre_w >= 35) and (post_w < int(0.60 * pre_w))
+            if bad_height or bad_width:
                 logger.debug(
-                    f"keep_tube_component: {pre_comp_area} → {post_comp_area}px² "
-                    f"({pre_comp_area - post_comp_area}px removed)"
+                    f"keep_tube_component reverted: span shrink {pre_w}x{pre_h} -> {post_w}x{post_h}"
                 )
-            mask = comp_filtered
+            else:
+                if post_comp_area < pre_comp_area:
+                    logger.debug(
+                        f"keep_tube_component: {pre_comp_area} → {post_comp_area}px² "
+                        f"({pre_comp_area - post_comp_area}px removed)"
+                    )
+                mask = comp_filtered
         else:
             logger.debug(
-                f"keep_tube_component reverted: {pre_comp_area} → {post_comp_area}px²"
+                f"keep_tube_component reverted: {pre_comp_area} → {post_comp_area}px² "
+                f"(keep<{min_component_keep_ratio:.2f})"
             )
 
         final_area = cv2.countNonZero(mask)
