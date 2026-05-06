@@ -1,5 +1,6 @@
 import uuid
 import datetime
+import sqlite3
 from pathlib import Path
 
 import cv2
@@ -13,8 +14,12 @@ from src.acquisition.fill_level_detector import (
 )
 from src.acquisition.stability_detector import DepthStabilityDetector
 from src.acquisition.distance_calibrator import DistanceCalibrator
-from src.acquisition.volume_gate import run_volume_gate
-from src.acquisition.capture_mode_gate import run_capture_mode_gate
+from src.acquisition.volume_gate import run_volume_gate, load_registry
+from src.acquisition.capture_mode_gate import (
+    run_capture_mode_gate,
+    run_multi_slot_gate,
+    run_multi_tube_assignment_gate,
+)
 from src.acquisition.pipeline_integration import PreprocessingPipeline
 from src.annotation.roi_extractor import DepthROIExtractor
 from src.annotation.sam_segmentor import SAMSegmentor
@@ -117,6 +122,131 @@ def _draw_preview_overlays(
     return frame
 
 
+def _bbox_center(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
+    x, y, w, h = bbox
+    return (x + (w * 0.5), y + (h * 0.5))
+
+
+def _bbox_mean_saturation(
+    bbox: tuple[int, int, int, int],
+    rgb_frame: np.ndarray,
+) -> float:
+    """Mean HSV saturation of the inner 60 % of a bbox crop.
+
+    The 20 % margin on each side strips background contamination at the edges
+    of a loose depth bbox without requiring a SAM mask.
+    """
+    x, y, w, h = bbox
+    mx, my = max(1, int(w * 0.20)), max(1, int(h * 0.20))
+    x1, y1 = max(0, x + mx), max(0, y + my)
+    x2, y2 = min(rgb_frame.shape[1], x + w - mx), min(rgb_frame.shape[0], y + h - my)
+    crop = rgb_frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    return float(np.mean(hsv[:, :, 1]))
+
+
+def _assign_bboxes_to_slots_by_color(
+    bboxes: list[tuple[int, int, int, int]],
+    rgb_frame: np.ndarray,
+    slot_declarations: list[dict],
+) -> list[int] | None:
+    """Initial slot assignment using RGB colour (HSV saturation).
+
+    Grey/neutral tubes have low saturation; coloured tubes have high saturation.
+    Only usable when some slots are grey-family and others are not — returns
+    None when all slots share the same colour family.
+    """
+    def _is_grey(class_id: str) -> bool:
+        u = class_id.upper()
+        return "GREY" in u or "GRAY" in u
+
+    grey_slots   = [i for i, s in enumerate(slot_declarations) if     _is_grey(s["class_id"])]
+    colour_slots = [i for i, s in enumerate(slot_declarations) if not _is_grey(s["class_id"])]
+    if not grey_slots or not colour_slots:
+        return None  # all same colour family — cannot distinguish by saturation
+
+    sats = [_bbox_mean_saturation(b, rgb_frame) for b in bboxes]
+    # rank bboxes: lowest sat first (→ grey), highest last (→ coloured)
+    bbox_by_sat = sorted(range(len(bboxes)), key=lambda i: sats[i])
+
+    mapping: list[int] = [0] * len(bboxes)
+    for rank, bbox_idx in enumerate(bbox_by_sat):
+        if rank < len(grey_slots):
+            mapping[bbox_idx] = grey_slots[rank]
+        else:
+            mapping[bbox_idx] = colour_slots[rank - len(grey_slots)]
+    return mapping
+
+
+def _assign_bboxes_to_slots_by_volume(
+    bboxes: list[tuple[int, int, int, int]],
+    slot_declarations: list[dict],
+) -> list[int] | None:
+    """Initial slot assignment by bbox area vs declared volume.
+
+    Matches the smallest-area bbox to the smallest-volume slot, largest to
+    largest.  Works at any turntable rotation angle and requires no operator
+    input.
+
+    Returns None when all declared volumes are equal (no information to
+    distinguish tubes), signalling the caller to fall back to x-sorted order.
+    """
+    volumes = [s.get("volume_ml", 0.0) for s in slot_declarations]
+    if len(set(volumes)) < len(volumes):
+        return None  # duplicate volumes — cannot distinguish by size
+
+    areas = [w * h for _, _, w, h in bboxes]
+    bbox_order = sorted(range(len(areas)), key=lambda i: areas[i])
+    slot_order  = sorted(range(len(volumes)), key=lambda i: volumes[i])
+
+    mapping: list[int] = [0] * len(bboxes)
+    for rank, bbox_idx in enumerate(bbox_order):
+        mapping[bbox_idx] = slot_order[rank]
+    return mapping
+
+
+def _assign_bboxes_to_slot_tracks(
+    bboxes: list[tuple[int, int, int, int]],
+    slot_center_tracks: list[tuple[float, float] | None] | None,
+) -> list[int]:
+    """Assign each detected bbox index to a declared slot index by track proximity."""
+    n = len(bboxes)
+    if (
+        n == 0
+        or slot_center_tracks is None
+        or len(slot_center_tracks) != n
+        or any(center is None for center in slot_center_tracks)
+    ):
+        return list(range(n))
+
+    centers = [_bbox_center(bbox) for bbox in bboxes]
+    pairs: list[tuple[float, int, int]] = []
+    for bbox_idx, (cx, cy) in enumerate(centers):
+        for slot_idx, track in enumerate(slot_center_tracks):
+            tx, ty = track  # type: ignore[misc]
+            pairs.append((float(np.hypot(cx - tx, cy - ty)), bbox_idx, slot_idx))
+
+    pairs.sort(key=lambda item: item[0])
+    assigned_bboxes: set[int] = set()
+    assigned_slots: set[int] = set()
+    mapping: list[int | None] = [None] * n
+
+    for _, bbox_idx, slot_idx in pairs:
+        if bbox_idx in assigned_bboxes or slot_idx in assigned_slots:
+            continue
+        mapping[bbox_idx] = slot_idx
+        assigned_bboxes.add(bbox_idx)
+        assigned_slots.add(slot_idx)
+        if len(assigned_bboxes) == n:
+            break
+
+    if any(slot_idx is None for slot_idx in mapping):
+        return list(range(n))
+    return [int(slot_idx) for slot_idx in mapping]
+
+
 def _prompt_fill_level_declaration() -> FillLevelResult | None:
     """Prompt operator to declare fill level before capture."""
     while True:
@@ -138,6 +268,35 @@ def _prompt_fill_level_declaration() -> FillLevelResult | None:
         if user_input == "q":
             return None
         print("Invalid input. Enter F, H, E, or Q.")
+
+
+def run_camera_angle_gate() -> float:
+    """Prompt operator to declare camera angle for the session."""
+    prompt = "Camera angle (degrees) [0-359, default 0]: "
+    attempts = 0
+    while attempts < 2:
+        raw = input(prompt).strip()
+        if raw == "":
+            camera_angle_deg = 0.0
+            logger.info(f"Camera angle set to {camera_angle_deg}°")
+            return camera_angle_deg
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning(f"Non-numeric camera angle input '{raw}', defaulting to 0.0°")
+            logger.info("Camera angle set to 0.0°")
+            return 0.0
+        if 0.0 <= value <= 359.9:
+            logger.info(f"Camera angle set to {value}°")
+            return value
+        attempts += 1
+        if attempts < 2:
+            print(f"Value {value} out of range [0-359]. Re-enter or press Enter for default.")
+        else:
+            logger.warning(f"Camera angle {value} out of range after re-prompt, defaulting to 0.0°")
+            logger.info("Camera angle set to 0.0°")
+            return 0.0
+    return 0.0
 
 
 def _process_roi(
@@ -162,6 +321,9 @@ def _process_roi(
     is_inverted: bool = False,
     fill_level_result: FillLevelResult | None = None,
     intrinsics: object = None,
+    camera_angle_deg: float = 0.0,
+    tube_index: int = 0,
+    instance_class_id: str | None = None,
 ) -> tuple[bool, float | None]:
     """Process a single ROI through segmentation, annotation, and cleaning.
     
@@ -261,18 +423,26 @@ def _process_roi(
     if cfg.depth_mask_refiner.enabled:
         from src.annotation.metadata_builder import build_image_metadata
 
+        if instance_class_id is None:
+            instance_class_id = class_id
+
+        instance_ann_dir = Path(cfg.storage.root_dir) / "annotations" / instance_class_id / session_id
+        instance_ann_dir.mkdir(parents=True, exist_ok=True)
+
+        mask_filename = f"{image_id}_mask_{tube_index}.png"
+        cv2.imwrite(str(instance_ann_dir / mask_filename), mask)
         instance_dict = {
-            "instance_id": f"{image_id}_tube_0",
+            "instance_id": f"{image_id}_tube_{tube_index}",
             "class_id": class_id,
             "volume_ml": volume_ml,
-            "mask_file": f"{image_id}_mask_0.png",
+            "mask_file": mask_filename,
             "mask": mask,
             "bbox": bbox,
-            "rotation_angle_deg": 0.0,
+            "rotation_angle_deg": camera_angle_deg,
             "occlusion_percent": 0.0,
             "distance_m": float(median_depth_mm / 1000.0)
                           if median_depth_mm is not None else None,
-            "sam_iou_score": sam_iou_score if sam_iou_score is not None else None,
+            "sam_iou_score": round(sam_iou_score, 4) if sam_iou_score is not None else None,
         }
         if fill_level_result is not None:
             instance_dict["fill_level"] = {
@@ -281,15 +451,28 @@ def _process_roi(
                 "boundary_ratio": float(fill_level_result.boundary_ratio),
             }
 
+        session_dir = Path(cfg.storage.root_dir) / "annotations" / instance_class_id / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+
         image_meta = build_image_metadata(
             image_id=image_id,
             rgb_image=rgb_frame,
             instances=[instance_dict],
             capture_mode=orientation,
             lighting_condition="unknown",
+            quality_metrics={
+                "image_id": image_id,
+                "class_id": class_id,
+                "blur_score": float(getattr(quality_metrics, "blur_score", 0.0)),
+                "coverage_ratio": round(
+                    float(np.count_nonzero(mask > 0)) / float(max(1, bbox[2] * bbox[3])), 4
+                ),
+                "sam_iou_score": float(sam_iou_score if sam_iou_score is not None else 0.0),
+                "depth_variance": float(getattr(quality_metrics, "depth_std_mm", 0.0)) ** 2,
+                "quality_score": float(getattr(quality_metrics, "quality_score", 0.0)),
+            } if quality_metrics is not None else None,
         )
 
-        session_dir = Path(cfg.storage.root_dir) / "raw" / class_id / session_id
         writer.write_image_metadata(image_meta, session_dir)
     # --- End instance metadata path ---
 
@@ -347,46 +530,53 @@ def _process_roi(
             }
         }
     
-    metadata = build_metadata(
-        image_id,
-        class_id,
-        volume_ml,
-        bbox,
-        mask,
-        rgb_frame.shape,
-        sam_iou_score=sam_iou_score,
-        calibration_metadata=calibration_metadata,
-    )
-    if fill_level_result is not None:
-        metadata["fill_level"] = {
-            "level": fill_level_result.level.value,
-            "confidence": fill_level_result.confidence,
-            "boundary_ratio": fill_level_result.boundary_ratio,
-        }
+    if cfg.pipeline.legacy_metadata:
+        metadata = build_metadata(
+            image_id,
+            class_id,
+            volume_ml,
+            bbox,
+            mask,
+            rgb_frame.shape,
+            sam_iou_score=sam_iou_score,
+            calibration_metadata=calibration_metadata,
+        )
+        if fill_level_result is not None:
+            metadata["fill_level"] = {
+                "level": fill_level_result.level.value,
+                "confidence": fill_level_result.confidence,
+                "boundary_ratio": fill_level_result.boundary_ratio,
+            }
 
-        metadata["quality_metrics"] = {
-            "image_id": image_id,
-            "class_id": class_id,
-            "blur_score": float(getattr(quality_metrics, "blur_score", 0.0)),
-            "coverage_ratio": float(getattr(quality_metrics, "coverage_ratio", 0.0)),
-            "sam_iou_score": float(sam_iou_score if sam_iou_score is not None else 0.0),
-            "depth_variance": float(getattr(quality_metrics, "depth_variance", 0.0)),
-            "quality_score": float(getattr(quality_metrics, "quality_score", 0.0)),
-        }
-    
-    raw_dir = root / "raw" / class_id / session_id
-    ann_dir = root / "annotations" / class_id / session_id
-    
-    writer.write(
-        image_id,
-        class_id,
-        session_id,
-        rgb_frame,
-        depth_frame,
-        mask,
-        bbox,
-        metadata,
-    )
+            metadata["quality_metrics"] = {
+                "image_id": image_id,
+                "class_id": class_id,
+                "blur_score": float(getattr(quality_metrics, "blur_score", 0.0)),
+                "coverage_ratio": round(
+                    float(np.count_nonzero(mask > 0)) / float(max(1, bbox[2] * bbox[3])), 4
+                ),
+                "sam_iou_score": float(sam_iou_score if sam_iou_score is not None else 0.0),
+                "depth_variance": float(getattr(quality_metrics, "depth_std_mm", 0.0)) ** 2,
+                "quality_score": float(getattr(quality_metrics, "quality_score", 0.0)),
+            }
+
+        raw_dir = root / "raw" / class_id / session_id
+        ann_dir = root / "annotations" / class_id / session_id
+
+        writer.write(
+            image_id,
+            class_id,
+            session_id,
+            rgb_frame,
+            depth_frame,
+            mask,
+            bbox,
+            metadata,
+        )
+    else:
+        logger.debug("Legacy metadata disabled — skipping flat schema write")
+        raw_dir = root / "raw" / class_id / session_id
+        ann_dir = root / "annotations" / class_id / session_id
     
     # Run cleaning pipeline
     cleaned_raw = root / "cleaned" / "raw" / class_id / session_id
@@ -473,14 +663,391 @@ def _process_roi(
 
             rgba[:, :, 3] = final_alpha
             nobg_bgr = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
-             
-            nobg_path = ann_dir / f"{image_id}_rgb_nobg.png"
+
+            nobg_ann_dir = ann_dir
+            if instance_class_id is not None:
+                nobg_ann_dir = Path(cfg.storage.root_dir) / "annotations" / instance_class_id / session_id
+                nobg_ann_dir.mkdir(parents=True, exist_ok=True)
+
+            nobg_path = nobg_ann_dir / f"{image_id}_rgb_nobg.png"
             cv2.imwrite(str(nobg_path), nobg_bgr)
             logger.debug(f"Background removed: {image_id}")
         except Exception as e:
             logger.warning(f"Background removal failed for {image_id}: {e}")
     
     return (True, sam_iou_score)
+
+
+def _process_multi_roi(
+    rgb_frame: np.ndarray,
+    depth_frame: np.ndarray,
+    bboxes: list[tuple[int, int, int, int]],
+    class_id: str,
+    volume_ml: float,
+    session_id: str,
+    segmentor,
+    writer,
+    blur_detector,
+    duplicate_remover,
+    bbox_filter,
+    background_remover,
+    cfg,
+    root: Path,
+    preprocessing_pipeline: PreprocessingPipeline | None = None,
+    calibration_result: dict | None = None,
+    orientation: str = 'side',
+    is_inverted: bool = False,
+    fill_level_result: FillLevelResult | None = None,
+    intrinsics: object = None,
+    camera_angle_deg: float = 0.0,
+    slot_declarations: list[dict] | None = None,
+    duplicate_raw_per_instance_classes: bool = False,
+) -> tuple[int, list[float | None]]:
+    """Process N bboxes from one frame as a single multi-instance record.
+
+    One shared image_id is generated for the frame. Frame-level files (RGB,
+    depth) are written once. Each instance gets its own mask file. A single
+    metadata JSON is produced with all N InstanceMetadata entries via the
+    Track C schema. The legacy flat-schema write is skipped — it is
+    single-instance only and incompatible with this path.
+
+    Args:
+        rgb_frame, depth_frame: Full captured frame.
+        bboxes: N bboxes from extract_multi().
+        All other args: same semantics as _process_roi().
+
+    Returns:
+        (n_captured, iou_scores) — number of successfully segmented instances
+        and their per-instance SAM IoU scores.
+    """
+    from src.annotation.metadata_builder import build_image_metadata
+
+    if not bboxes:
+        return (0, [])
+
+    # In multi-tube "different" mode all instances in this frame belong to
+    # different classes, so use a neutral "MULTI" prefix rather than the
+    # session-level class_id, which would mislead filename-based inspection.
+    id_prefix = "MULTI" if (slot_declarations and duplicate_raw_per_instance_classes) else class_id
+    image_id = f"{id_prefix}_{uuid.uuid4().hex[:8]}"
+    quality_metrics = None
+
+    # Step 1 — Preprocess depth once for the whole frame
+    if preprocessing_pipeline:
+        depth_frame, quality_metrics, preprocess_stats = preprocessing_pipeline.process_depth_frame(
+            depth_frame=depth_frame,
+            rgb_frame=rgb_frame,
+            frame_id=image_id,
+            compute_metrics=True,
+        )
+        if quality_metrics:
+            logger.debug(
+                f"[multi_roi] Preprocessing: quality={quality_metrics.quality_score:.2f}, "
+                f"time={preprocess_stats['total_time_ms']:.1f}ms"
+            )
+
+    # Step 2 — Write frame-level files once
+    raw_dir = root / "raw" / class_id / session_id
+    ann_dir = root / "annotations" / class_id / session_id
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    ann_dir.mkdir(parents=True, exist_ok=True)
+
+    cv2.imwrite(str(raw_dir / f"{image_id}_rgb.png"), rgb_frame)
+    depth_scaled = writer._scale_depth_for_preview(
+        depth_frame, image_id,
+        invert=bool(getattr(cfg.pipeline, "depth_preview_invert", True)),
+    )
+    cv2.imwrite(str(raw_dir / f"{image_id}_depth.png"), depth_scaled)
+    np.save(str(raw_dir / f"{image_id}_depth.npy"), depth_frame)
+
+    # Step 3 — Segment and refine each bbox, collect instances
+    instance_dicts: list[dict] = []
+    iou_scores: list[float | None] = []
+    tube_indices: list[int] = []
+
+    for tube_index, bbox in enumerate(bboxes):
+        other_bboxes = [b for i2, b in enumerate(bboxes) if i2 != tube_index]
+        segment_result = segmentor.segment(
+            rgb_frame, bbox,
+            depth_frame=depth_frame,
+            orientation=orientation,
+            is_inverted=is_inverted,
+            neighbor_bboxes=other_bboxes if other_bboxes else None,
+        )
+        if segment_result is None:
+            logger.debug(
+                f"[multi_roi] {image_id} tube_{tube_index}: SAM returned None, skipping"
+            )
+            continue
+
+        mask, sam_iou_score = segment_result
+
+        # Depth mask refinement (Track A) — per instance
+        median_depth_mm: float | None = None
+        if (
+            cfg.depth_mask_refiner.enabled
+            and orientation in cfg.depth_mask_refiner.apply_only_orientations
+            and depth_frame is not None
+            and intrinsics is not None
+        ):
+            from src.processing.depth_mask_refiner import refine_mask
+            original_mask = mask.copy()
+            refined_mask, median_depth_mm = refine_mask(
+                mask=mask,
+                depth_frame=depth_frame,
+                bbox=bbox,
+                intrinsics=intrinsics,
+                config=cfg.depth_mask_refiner,
+                orientation=orientation,
+            )
+            orig_area = float(np.count_nonzero(original_mask))
+            ref_area = float(np.count_nonzero(refined_mask))
+            area_ratio = ref_area / max(orig_area, 1.0)
+            orig_rows = np.where(original_mask.any(axis=1))[0]
+            ref_rows = np.where(refined_mask.any(axis=1))[0]
+            orig_cols = np.where(original_mask.any(axis=0))[0]
+            ref_cols = np.where(refined_mask.any(axis=0))[0]
+            orig_h = int(orig_rows[-1] - orig_rows[0] + 1) if len(orig_rows) > 0 else 0
+            ref_h = int(ref_rows[-1] - ref_rows[0] + 1) if len(ref_rows) > 0 else 0
+            orig_w = int(orig_cols[-1] - orig_cols[0] + 1) if len(orig_cols) > 0 else 0
+            ref_w = int(ref_cols[-1] - ref_cols[0] + 1) if len(ref_cols) > 0 else 0
+            bad_shrink = area_ratio < 0.75
+            bad_height = (orig_h >= 60) and (ref_h < int(0.70 * orig_h))
+            bad_width = (orig_w >= 35) and (ref_w < int(0.55 * orig_w))
+            if bad_shrink or bad_height or bad_width:
+                logger.debug(
+                    f"[multi_roi] Depth mask refinement rejected tube_{tube_index}: "
+                    f"area_ratio={area_ratio:.2f}, height={orig_h}->{ref_h}, "
+                    f"width={orig_w}->{ref_w}"
+                )
+            else:
+                mask = refined_mask
+
+        # Preprocessing mask refinement — per instance
+        if preprocessing_pipeline and preprocessing_pipeline.mask_refinement_enabled:
+            original_mask = mask.copy()
+            refined_mask, refinement_stats = preprocessing_pipeline.refine_mask(
+                depth_frame=depth_frame,
+                mask=mask,
+                frame_id=image_id,
+            )
+            if refinement_stats.get('refined', False):
+                orig_area = float(np.count_nonzero(original_mask))
+                ref_area = float(np.count_nonzero(refined_mask))
+                area_ratio = ref_area / max(orig_area, 1.0)
+                orig_rows = np.where(original_mask.any(axis=1))[0]
+                ref_rows = np.where(refined_mask.any(axis=1))[0]
+                orig_cols = np.where(original_mask.any(axis=0))[0]
+                ref_cols = np.where(refined_mask.any(axis=0))[0]
+                orig_h = int(orig_rows[-1] - orig_rows[0] + 1) if len(orig_rows) > 0 else 0
+                ref_h = int(ref_rows[-1] - ref_rows[0] + 1) if len(ref_rows) > 0 else 0
+                orig_w = int(orig_cols[-1] - orig_cols[0] + 1) if len(orig_cols) > 0 else 0
+                ref_w = int(ref_cols[-1] - ref_cols[0] + 1) if len(ref_cols) > 0 else 0
+                bad_shrink = area_ratio < 0.75
+                bad_height = (orig_h >= 60) and (ref_h < int(0.70 * orig_h))
+                bad_width = (orig_w >= 35) and (ref_w < int(0.55 * orig_w))
+                if not (bad_shrink or bad_height or bad_width):
+                    mask = refined_mask
+                    logger.debug(
+                        f"[multi_roi] Mask refinement accepted tube_{tube_index}: "
+                        f"IoU+{refinement_stats['iou_improvement_pct']:.1f}%, "
+                        f"area_ratio={area_ratio:.2f}"
+                    )
+
+        inst_class_id = class_id
+        inst_volume_ml = volume_ml
+        if slot_declarations and tube_index < len(slot_declarations):
+            inst_class_id = slot_declarations[tube_index].get("class_id", class_id)
+            inst_volume_ml = slot_declarations[tube_index].get("volume_ml", volume_ml)
+
+        # Write mask for this instance to its class-specific annotation directory
+        mask_filename = f"{image_id}_mask_{tube_index}.png"
+        instance_ann_dir = Path(cfg.storage.root_dir) / "annotations" / inst_class_id / session_id
+        instance_ann_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(instance_ann_dir / mask_filename), mask)
+
+        instance_dict = {
+            "instance_id": f"{image_id}_tube_{tube_index}",
+            "class_id": inst_class_id,
+            "volume_ml": inst_volume_ml,
+            "mask_file": mask_filename,
+            "mask": mask,
+            "bbox": bbox,
+            "rotation_angle_deg": camera_angle_deg,
+            "occlusion_percent": 0.0,
+            "distance_m": float(median_depth_mm / 1000.0)
+                          if median_depth_mm is not None else None,
+            "sam_iou_score": round(sam_iou_score, 4) if sam_iou_score is not None else None,
+        }
+        if fill_level_result is not None:
+            instance_dict["fill_level"] = {
+                "level": fill_level_result.level.value,
+                "confidence": fill_level_result.confidence,
+                "boundary_ratio": float(fill_level_result.boundary_ratio),
+            }
+
+        instance_dicts.append(instance_dict)
+        iou_scores.append(sam_iou_score)
+        tube_indices.append(tube_index)
+        logger.debug(
+            f"[multi_roi] {image_id} tube_{tube_index}: SAM IoU={sam_iou_score:.4f}"
+        )
+
+    if not instance_dicts:
+        logger.warning(
+            f"[multi_roi] {image_id}: all {len(bboxes)} bboxes failed SAM segmentation"
+        )
+        return (0, [])
+
+    if duplicate_raw_per_instance_classes:
+        unique_instance_classes = {
+            str(d.get("class_id", class_id))
+            for d in instance_dicts
+            if d.get("class_id")
+        }
+        for instance_class_id in unique_instance_classes:
+            if instance_class_id == class_id:
+                continue
+            instance_raw_dir = root / "raw" / instance_class_id / session_id
+            instance_raw_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(instance_raw_dir / f"{image_id}_rgb.png"), rgb_frame)
+            cv2.imwrite(str(instance_raw_dir / f"{image_id}_depth.png"), depth_scaled)
+            np.save(str(instance_raw_dir / f"{image_id}_depth.npy"), depth_frame)
+
+    # Step 4 — Write metadata per class to avoid mixed-class records per folder
+    instances_by_class: dict[str, list[dict]] = {}
+    for inst in instance_dicts:
+        inst_class_id = str(inst.get("class_id", class_id))
+        instances_by_class.setdefault(inst_class_id, []).append(inst)
+
+    for inst_class_id, class_instances in instances_by_class.items():
+        class_mask_px = sum(int(np.count_nonzero(d["mask"] > 0)) for d in class_instances)
+        class_bbox_px = sum(int(d["bbox"][2] * d["bbox"][3]) for d in class_instances)
+        class_iou_scores = [
+            float(d["sam_iou_score"])
+            for d in class_instances
+            if d.get("sam_iou_score") is not None
+        ]
+        class_qm_dict = {
+            "image_id": image_id,
+            "class_id": inst_class_id,
+            "blur_score": float(getattr(quality_metrics, "blur_score", 0.0)),
+            "coverage_ratio": round(class_mask_px / max(1, class_bbox_px), 4),
+            "sam_iou_score": round(
+                sum(class_iou_scores) / max(1, len(class_iou_scores)), 4
+            ),
+            "depth_variance": float(getattr(quality_metrics, "depth_std_mm", 0.0)) ** 2,
+            "quality_score": float(getattr(quality_metrics, "quality_score", 0.0)),
+        } if quality_metrics is not None else None
+
+        class_image_meta = build_image_metadata(
+            image_id=image_id,
+            rgb_image=rgb_frame,
+            instances=class_instances,
+            capture_mode=orientation,
+            lighting_condition="unknown",
+            quality_metrics=class_qm_dict,
+        )
+        class_ann_dir = Path(cfg.storage.root_dir) / "annotations" / inst_class_id / session_id
+        class_ann_dir.mkdir(parents=True, exist_ok=True)
+        writer.write_image_metadata(class_image_meta, class_ann_dir)
+
+    logger.info(
+        f"[multi_roi] {image_id}: {len(instance_dicts)}/{len(bboxes)} instances captured"
+    )
+
+    # Step 6 — Run cleaning once for the frame
+    cleaned_raw = root / "cleaned" / "raw" / class_id / session_id
+    cleaned_ann = root / "cleaned" / "annotations" / class_id / session_id
+    blur_detector.filter_directory(raw_dir, cleaned_raw)
+    duplicate_remover.remove_duplicates(cleaned_raw)
+    bbox_filter.filter_directory(raw_dir, ann_dir, cleaned_raw, cleaned_ann)
+
+    # Step 7 — Background removal per instance
+    if cfg.pipeline.background_removal:
+        for inst_dict, tube_idx in zip(instance_dicts, tube_indices):
+            try:
+                x, y, box_w, box_h = inst_dict["bbox"]
+                pad_x = max(20, int(round(box_w * 0.40)))
+                pad_y = max(24, int(round(box_h * 0.35)))
+                crop_x0 = max(0, x - pad_x)
+                crop_y0 = max(0, y - pad_y)
+                crop_x1 = min(rgb_frame.shape[1], x + box_w + pad_x)
+                crop_y1 = min(rgb_frame.shape[0], y + box_h + pad_y)
+
+                roi_crop = rgb_frame[crop_y0:crop_y1, crop_x0:crop_x1]
+                nobg_crop = background_remover.remove_from_array(roi_crop)
+
+                if nobg_crop.ndim == 3 and nobg_crop.shape[2] == 4:
+                    rgba = nobg_crop.copy()
+                elif nobg_crop.ndim == 3 and nobg_crop.shape[2] == 3:
+                    rgba = cv2.cvtColor(nobg_crop, cv2.COLOR_BGR2BGRA)
+                else:
+                    raise ValueError(
+                        f"Unexpected background remover output shape: {nobg_crop.shape}"
+                    )
+
+                rembg_alpha = rgba[:, :, 3]
+                bbox_area = float(max(1, (crop_x1 - crop_x0) * (crop_y1 - crop_y0)))
+                rembg_binary = (rembg_alpha > 0).astype(np.uint8)
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    rembg_binary, connectivity=8,
+                )
+                rembg_component_alpha = (rembg_binary * 255).astype(np.uint8)
+                rembg_best_area = float(np.count_nonzero(rembg_component_alpha))
+
+                if num_labels > 2:
+                    roi_cx = rembg_component_alpha.shape[1] * 0.5
+                    best_label = -1
+                    best_score = -1e9
+                    for lbl in range(1, num_labels):
+                        area = float(stats[lbl, cv2.CC_STAT_AREA])
+                        if area < 40.0:
+                            continue
+                        left = float(stats[lbl, cv2.CC_STAT_LEFT])
+                        width = float(max(1, stats[lbl, cv2.CC_STAT_WIDTH]))
+                        height = float(max(1, stats[lbl, cv2.CC_STAT_HEIGHT]))
+                        cx = left + (width * 0.5)
+                        height_cov = min(
+                            height / max(float(rembg_component_alpha.shape[0]), 1.0), 1.4
+                        )
+                        area_cov = min(area / bbox_area, 1.6)
+                        center_score = max(
+                            0.0,
+                            1.0 - (
+                                abs(cx - roi_cx)
+                                / max(float(rembg_component_alpha.shape[1]) * 0.70, 1.0)
+                            ),
+                        )
+                        score = 0.42 * area_cov + 0.33 * height_cov + 0.25 * center_score
+                        if score > best_score:
+                            best_score = score
+                            best_label = lbl
+                            rembg_best_area = area
+                    if best_label > 0:
+                        rembg_component_alpha = np.zeros_like(rembg_alpha, dtype=np.uint8)
+                        rembg_component_alpha[labels == best_label] = 255
+
+                final_alpha = rembg_component_alpha
+                if rembg_best_area < max(120.0, 0.05 * bbox_area):
+                    final_alpha = (rembg_binary * 255).astype(np.uint8)
+
+                rgba[:, :, 3] = final_alpha
+                instance_class_id = str(inst_dict.get("class_id", class_id))
+                instance_ann_dir = Path(cfg.storage.root_dir) / "annotations" / instance_class_id / session_id
+                instance_ann_dir.mkdir(parents=True, exist_ok=True)
+                nobg_path = instance_ann_dir / f"{image_id}_rgb_nobg_{tube_idx}.png"
+                cv2.imwrite(str(nobg_path), cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
+                logger.debug(
+                    f"[multi_roi] Background removed: {image_id} tube_{tube_idx}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[multi_roi] Background removal failed for {image_id} "
+                    f"tube_{tube_idx}: {e}"
+                )
+
+    return (len(instance_dicts), iou_scores)
 
 
 def _select_tube_class(matched_tubes: list[dict]) -> str:
@@ -560,7 +1127,10 @@ def run_pipeline(
         volume_ml, matched_tubes = run_volume_gate()
     else:
         volume_ml = preselected_volume_ml
-        matched_tubes = [{"class_id": preselected_class_id}] if preselected_class_id else []
+        matched_tubes = (
+            [{"class_id": preselected_class_id, "volume_ml": volume_ml}]
+            if preselected_class_id else []
+        )
 
     session_fill_level_result = _prompt_fill_level_declaration()
     if session_fill_level_result is None:
@@ -568,7 +1138,49 @@ def run_pipeline(
         return
 
     capture_mode = preselected_capture_mode or run_capture_mode_gate()
-    
+    multi_tube_assignment = "same"
+    if capture_mode in {"multi_side", "multi_top"}:
+        multi_tube_assignment = run_multi_tube_assignment_gate()
+    if capture_mode in {"multi_side", "multi_top"} and multi_tube_assignment == "different":
+        slot_available_tubes: list[dict] = []
+        try:
+            pre_capture_db_path = (
+                Path(cfg.storage.root_dir).parent / "sessions" / "pre_capture" / "pre_capture.db"
+            )
+            if pre_capture_db_path.exists():
+                with sqlite3.connect(str(pre_capture_db_path)) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT volume, class_name, family
+                        FROM tube_classes
+                        ORDER BY volume, class_name
+                        """
+                    ).fetchall()
+                for volume, class_name, family in rows:
+                    try:
+                        slot_volume_ml = float(str(volume).lower().replace("ml", ""))
+                    except ValueError:
+                        continue
+                    slot_available_tubes.append(
+                        {
+                            "class_id": class_name,
+                            "family": family,
+                            "volume_ml": slot_volume_ml,
+                        }
+                    )
+            if not slot_available_tubes:
+                slot_available_tubes = load_registry(Path(cfg.storage.registry_path))
+        except Exception as exc:
+            logger.warning(f"Failed to load multi-slot class list: {exc}. Falling back to current matched tubes.")
+            slot_available_tubes = matched_tubes
+        slot_declarations = run_multi_slot_gate(
+            available_tubes=slot_available_tubes,
+            cfg=cfg,
+        )
+    else:
+        slot_declarations = None
+    camera_angle_deg = run_camera_angle_gate()
+
     session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     # Handle class selection — NEW: Interactive prompt
@@ -662,6 +1274,7 @@ def run_pipeline(
     # Quality tracking for R2.4
     total_annotation_attempts = 0
     high_quality_annotations = 0
+    slot_center_tracks: list[tuple[float, float] | None] | None = None
     
     try:
         while True:
@@ -671,6 +1284,7 @@ def run_pipeline(
                 continue
             
             frame_count += 1
+            image_id = frame_count
             rgb_frame, depth_frame = frames
             
             # Get depth info for preview (convert roi center to meters)
@@ -690,6 +1304,103 @@ def run_pipeline(
             
             # Extract ROI(s) — mode-dependent
             bboxes = extract_bboxes_for_mode(capture_mode, roi_extractor, depth_frame)
+            active_slots = None
+            if capture_mode in {"multi_side", "multi_top"} and slot_declarations:
+                N = len(slot_declarations)
+                M = len(bboxes)
+                logger.debug(f"Frame {image_id}: {M} tubes detected, {N} declared")
+
+                if M > N:
+                    logger.warning(
+                        f"Over-detection: {M} tubes detected, {N} declared. "
+                        f"Verify scene. Skipping frame {image_id}."
+                    )
+                    continue
+
+                if M < N:
+                    if multi_tube_assignment == "different":
+                        logger.warning(
+                            f"Under-detection: {M} of {N} tubes visible in different-tube mode. "
+                            f"Skipping frame {image_id} to avoid class mixing."
+                        )
+                        continue
+                    logger.warning(
+                        f"Under-detection: {M} of {N} tubes visible "
+                        f"(turntable occlusion). Auto-continuing."
+                    )
+                    # use first M slot declarations only
+                    active_slots = slot_declarations[:M]
+                else:
+                    if multi_tube_assignment == "different":
+                        first_init = slot_center_tracks is None or any(
+                            c is None for c in slot_center_tracks
+                        )
+                        if slot_center_tracks is None or len(slot_center_tracks) != N:
+                            slot_center_tracks = [None] * N
+
+                        if first_init:
+                            # --- Initial slot seeding (rotation-invariant) ---
+                            # Priority 1: RGB colour — most reliable for
+                            #   differently-coloured tubes (e.g. grey vs green).
+                            #   Low HSV saturation → grey slot; high → coloured slot.
+                            # Priority 2: bbox area vs declared volume — works when
+                            #   tubes share a colour family but differ in size.
+                            # Fallback: x-sorted identity (logs a warning).
+                            colour_mapping = _assign_bboxes_to_slots_by_color(
+                                bboxes, rgb_frame, slot_declarations
+                            )
+                            vol_mapping = _assign_bboxes_to_slots_by_volume(
+                                bboxes, slot_declarations
+                            )
+
+                            if colour_mapping is not None:
+                                bbox_slot_indices = colour_mapping
+                                sats = [
+                                    _bbox_mean_saturation(b, rgb_frame) for b in bboxes
+                                ]
+                                sat_str = ", ".join(
+                                    f"bbox[{i}] sat={sats[i]:.1f}"
+                                    f"→{slot_declarations[colour_mapping[i]]['class_id']}"
+                                    for i in range(len(bboxes))
+                                )
+                                if vol_mapping is not None and colour_mapping != vol_mapping:
+                                    logger.warning(
+                                        f"Slot init: colour and size DISAGREE — "
+                                        f"using colour. {sat_str}"
+                                    )
+                                else:
+                                    logger.info(f"Slot init by RGB colour: {sat_str}")
+                            elif vol_mapping is not None:
+                                bbox_slot_indices = vol_mapping
+                                areas_str = ", ".join(
+                                    f"bbox[{i}]({bboxes[i][2]*bboxes[i][3]}px²)"
+                                    f"→{slot_declarations[vol_mapping[i]]['class_id']}"
+                                    for i in range(len(bboxes))
+                                )
+                                logger.info(f"Slot init by tube size: {areas_str}")
+                            else:
+                                bbox_slot_indices = list(range(N))
+                                logger.warning(
+                                    "Slots share same colour family and volume; "
+                                    "initial assignment uses x-sorted order — "
+                                    "verify first capture manually."
+                                )
+                        else:
+                            bbox_slot_indices = _assign_bboxes_to_slot_tracks(
+                                bboxes=bboxes,
+                                slot_center_tracks=slot_center_tracks,
+                            )
+
+                        active_slots = [slot_declarations[slot_idx] for slot_idx in bbox_slot_indices]
+                        centers = [_bbox_center(bbox) for bbox in bboxes]
+                        for bbox_idx, slot_idx in enumerate(bbox_slot_indices):
+                            slot_center_tracks[slot_idx] = centers[bbox_idx]
+
+                        logger.debug(
+                            f"Frame {image_id}: slot mapping bbox->slot {bbox_slot_indices}"
+                        )
+                    else:
+                        active_slots = slot_declarations
             frame_orientation = roi_extractor.orientation
             frame_is_inverted = roi_extractor.is_inverted
             logger.debug(
@@ -724,14 +1435,14 @@ def run_pipeline(
             
             logger.debug(f"Frame {frame_count}: Extracted {len(bboxes)} ROI(s)")
             
-            # Process each ROI independently
+            # Process each ROI — multi-mode paths use shared frame-level image_id
             root = Path(cfg.storage.root_dir)
             rois_captured_this_frame = 0
             first_bbox_for_preview = bboxes[0]  # For preview overlay
-            
-            for idx, bbox in enumerate(bboxes):
-                success, iou_score = _process_roi(
-                    rgb_frame, depth_frame, bbox,
+
+            if capture_mode in {"multi_side", "multi_top"}:
+                n_captured, iou_scores = _process_multi_roi(
+                    rgb_frame, depth_frame, bboxes,
                     class_id, volume_ml, session_id,
                     segmentor, writer, blur_detector,
                     duplicate_remover, bbox_filter, background_remover,
@@ -742,14 +1453,42 @@ def run_pipeline(
                     is_inverted=frame_is_inverted,
                     fill_level_result=session_fill_level_result,
                     intrinsics=streamer,
+                    camera_angle_deg=camera_angle_deg,
+                    slot_declarations=active_slots,
+                    duplicate_raw_per_instance_classes=(multi_tube_assignment == "different"),
                 )
-                
-                if success:
-                    rois_captured_this_frame += 1
-                    total_annotation_attempts += 1
-                    # Track high-quality annotations (IoU >= threshold)
+                rois_captured_this_frame += n_captured
+                total_annotation_attempts += n_captured
+                for iou_score in iou_scores:
                     if iou_score is not None and iou_score >= cfg.pipeline.sam_iou_threshold:
                         high_quality_annotations += 1
+            else:
+                for idx, bbox in enumerate(bboxes):
+                    success, iou_score = _process_roi(
+                        rgb_frame, depth_frame, bbox,
+                        class_id, volume_ml, session_id,
+                        segmentor, writer, blur_detector,
+                        duplicate_remover, bbox_filter, background_remover,
+                        cfg, root,
+                        preprocessing_pipeline=preprocessing_pipeline,
+                        calibration_result=calibration_result,
+                        orientation=frame_orientation,
+                        is_inverted=frame_is_inverted,
+                        fill_level_result=session_fill_level_result,
+                        intrinsics=streamer,
+                        camera_angle_deg=camera_angle_deg,
+                        tube_index=idx,
+                        instance_class_id=active_slots[idx]["class_id"]
+                        if capture_mode == "multi_side" and active_slots
+                        else None,
+                    )
+
+                    if success:
+                        rois_captured_this_frame += 1
+                        total_annotation_attempts += 1
+                        # Track high-quality annotations (IoU >= threshold)
+                        if iou_score is not None and iou_score >= cfg.pipeline.sam_iou_threshold:
+                            high_quality_annotations += 1
             
             # Track rejections
             if rois_captured_this_frame == 0:

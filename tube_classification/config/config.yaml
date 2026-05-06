@@ -37,7 +37,7 @@ camera:
 
 # Storage configuration: data directory paths and session naming
 storage:
-  root_dir: dataset/raw
+  root_dir: data/dataset/raw
   registry_path: config/registry.yaml
   sam_weights_path: models/MobileSAM/weights/mobile_sam.pt
   session_prefix: session
@@ -60,6 +60,8 @@ pipeline:
   border_margin_px: 15
   adaptive_depth_gate: false
   remove_background_blobs: true
+  single_side_depth_min_m: 0.32
+  single_side_depth_max_m: 0.56
 
   # Top-down capture mode shape filter
   top_min_roi_area_px: 200
@@ -86,6 +88,14 @@ pipeline:
 
   # Background removal (final cleaning step)
   background_removal: true  # Remove backgrounds from ROI crops and save separately
+
+  # Legacy flat-schema metadata write (build_metadata + writer.write)
+  legacy_metadata: true  # Set to false to skip flat schema and use Track C instance path only
+
+  # Multi-ROI extraction parameters (multi_side mode)
+  multi_roi_score_ratio: 0.70
+  multi_roi_nms_iou_threshold: 0.30
+  multi_roi_expected_max: 4
 
   # Preview settings for live overhead view
   preview:
@@ -117,7 +127,7 @@ pipeline:
 
   # Session organization settings
   session:
-    base_directory: 'dataset/sessions'  # Root directory for sessions
+    base_directory: 'data/dataset/sessions'  # Root directory for sessions
     auto_resume: false                  # Automatically resume interrupted sessions
     cleanup_on_reject: true             # Delete rejected captures immediately
     compression_level: 9                # PNG compression (0-9)
