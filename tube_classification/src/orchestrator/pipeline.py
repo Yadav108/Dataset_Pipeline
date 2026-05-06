@@ -127,85 +127,6 @@ def _bbox_center(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
     return (x + (w * 0.5), y + (h * 0.5))
 
 
-def _bbox_mean_saturation(
-    bbox: tuple[int, int, int, int],
-    rgb_frame: np.ndarray,
-) -> float:
-    """Mean HSV saturation of the inner 60 % of a bbox crop.
-
-    The 20 % margin on each side strips background contamination at the edges
-    of a loose depth bbox without requiring a SAM mask.
-    """
-    x, y, w, h = bbox
-    mx, my = max(1, int(w * 0.20)), max(1, int(h * 0.20))
-    x1, y1 = max(0, x + mx), max(0, y + my)
-    x2, y2 = min(rgb_frame.shape[1], x + w - mx), min(rgb_frame.shape[0], y + h - my)
-    crop = rgb_frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return 0.0
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    return float(np.mean(hsv[:, :, 1]))
-
-
-def _assign_bboxes_to_slots_by_color(
-    bboxes: list[tuple[int, int, int, int]],
-    rgb_frame: np.ndarray,
-    slot_declarations: list[dict],
-) -> list[int] | None:
-    """Initial slot assignment using RGB colour (HSV saturation).
-
-    Grey/neutral tubes have low saturation; coloured tubes have high saturation.
-    Only usable when some slots are grey-family and others are not — returns
-    None when all slots share the same colour family.
-    """
-    def _is_grey(class_id: str) -> bool:
-        u = class_id.upper()
-        return "GREY" in u or "GRAY" in u
-
-    grey_slots   = [i for i, s in enumerate(slot_declarations) if     _is_grey(s["class_id"])]
-    colour_slots = [i for i, s in enumerate(slot_declarations) if not _is_grey(s["class_id"])]
-    if not grey_slots or not colour_slots:
-        return None  # all same colour family — cannot distinguish by saturation
-
-    sats = [_bbox_mean_saturation(b, rgb_frame) for b in bboxes]
-    # rank bboxes: lowest sat first (→ grey), highest last (→ coloured)
-    bbox_by_sat = sorted(range(len(bboxes)), key=lambda i: sats[i])
-
-    mapping: list[int] = [0] * len(bboxes)
-    for rank, bbox_idx in enumerate(bbox_by_sat):
-        if rank < len(grey_slots):
-            mapping[bbox_idx] = grey_slots[rank]
-        else:
-            mapping[bbox_idx] = colour_slots[rank - len(grey_slots)]
-    return mapping
-
-
-def _assign_bboxes_to_slots_by_volume(
-    bboxes: list[tuple[int, int, int, int]],
-    slot_declarations: list[dict],
-) -> list[int] | None:
-    """Initial slot assignment by bbox area vs declared volume.
-
-    Matches the smallest-area bbox to the smallest-volume slot, largest to
-    largest.  Works at any turntable rotation angle and requires no operator
-    input.
-
-    Returns None when all declared volumes are equal (no information to
-    distinguish tubes), signalling the caller to fall back to x-sorted order.
-    """
-    volumes = [s.get("volume_ml", 0.0) for s in slot_declarations]
-    if len(set(volumes)) < len(volumes):
-        return None  # duplicate volumes — cannot distinguish by size
-
-    areas = [w * h for _, _, w, h in bboxes]
-    bbox_order = sorted(range(len(areas)), key=lambda i: areas[i])
-    slot_order  = sorted(range(len(volumes)), key=lambda i: volumes[i])
-
-    mapping: list[int] = [0] * len(bboxes)
-    for rank, bbox_idx in enumerate(bbox_order):
-        mapping[bbox_idx] = slot_order[rank]
-    return mapping
-
 
 def _assign_bboxes_to_slot_tracks(
     bboxes: list[tuple[int, int, int, int]],
@@ -879,7 +800,15 @@ def _process_multi_roi(
                           if median_depth_mm is not None else None,
             "sam_iou_score": round(sam_iou_score, 4) if sam_iou_score is not None else None,
         }
-        if fill_level_result is not None:
+        # Per-slot fill level takes priority; session-level is the fallback.
+        slot_fill = (
+            slot_declarations[tube_index].get("fill_level")
+            if slot_declarations and tube_index < len(slot_declarations)
+            else None
+        )
+        if slot_fill is not None:
+            instance_dict["fill_level"] = slot_fill
+        elif fill_level_result is not None:
             instance_dict["fill_level"] = {
                 "level": fill_level_result.level.value,
                 "confidence": fill_level_result.confidence,
@@ -890,7 +819,8 @@ def _process_multi_roi(
         iou_scores.append(sam_iou_score)
         tube_indices.append(tube_index)
         logger.debug(
-            f"[multi_roi] {image_id} tube_{tube_index}: SAM IoU={sam_iou_score:.4f}"
+            f"[multi_roi] {image_id} tube_{tube_index}: SAM IoU={sam_iou_score:.4f}, "
+            f"fill={instance_dict.get('fill_level', {}).get('level', 'n/a')}"
         )
 
     if not instance_dicts:
@@ -1339,52 +1269,18 @@ def run_pipeline(
                             slot_center_tracks = [None] * N
 
                         if first_init:
-                            # --- Initial slot seeding (rotation-invariant) ---
-                            # Priority 1: RGB colour — most reliable for
-                            #   differently-coloured tubes (e.g. grey vs green).
-                            #   Low HSV saturation → grey slot; high → coloured slot.
-                            # Priority 2: bbox area vs declared volume — works when
-                            #   tubes share a colour family but differ in size.
-                            # Fallback: x-sorted identity (logs a warning).
-                            colour_mapping = _assign_bboxes_to_slots_by_color(
-                                bboxes, rgb_frame, slot_declarations
+                            # Use the declared left-to-right order directly — the
+                            # operator gate already asks for slot direction and the
+                            # detector returns bboxes x-sorted. Colour/volume
+                            # heuristics were producing wrong class assignments when
+                            # similarly-saturated tubes (e.g. gold vs lavender) were
+                            # ranked incorrectly by saturation.
+                            bbox_slot_indices = list(range(N))
+                            slot_str = ", ".join(
+                                f"bbox[{i}]→{slot_declarations[i]['class_id']}"
+                                for i in range(N)
                             )
-                            vol_mapping = _assign_bboxes_to_slots_by_volume(
-                                bboxes, slot_declarations
-                            )
-
-                            if colour_mapping is not None:
-                                bbox_slot_indices = colour_mapping
-                                sats = [
-                                    _bbox_mean_saturation(b, rgb_frame) for b in bboxes
-                                ]
-                                sat_str = ", ".join(
-                                    f"bbox[{i}] sat={sats[i]:.1f}"
-                                    f"→{slot_declarations[colour_mapping[i]]['class_id']}"
-                                    for i in range(len(bboxes))
-                                )
-                                if vol_mapping is not None and colour_mapping != vol_mapping:
-                                    logger.warning(
-                                        f"Slot init: colour and size DISAGREE — "
-                                        f"using colour. {sat_str}"
-                                    )
-                                else:
-                                    logger.info(f"Slot init by RGB colour: {sat_str}")
-                            elif vol_mapping is not None:
-                                bbox_slot_indices = vol_mapping
-                                areas_str = ", ".join(
-                                    f"bbox[{i}]({bboxes[i][2]*bboxes[i][3]}px²)"
-                                    f"→{slot_declarations[vol_mapping[i]]['class_id']}"
-                                    for i in range(len(bboxes))
-                                )
-                                logger.info(f"Slot init by tube size: {areas_str}")
-                            else:
-                                bbox_slot_indices = list(range(N))
-                                logger.warning(
-                                    "Slots share same colour family and volume; "
-                                    "initial assignment uses x-sorted order — "
-                                    "verify first capture manually."
-                                )
+                            logger.info(f"Slot init (declared order): {slot_str}")
                         else:
                             bbox_slot_indices = _assign_bboxes_to_slot_tracks(
                                 bboxes=bboxes,

@@ -37,7 +37,7 @@ CLASS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 VOLUME_PATTERN = re.compile(r"^\d+(\.\d+)?ml$")
 
 
-def _now() -> str:
+def _now() -> str: 
     return datetime.now().isoformat()
 
 
