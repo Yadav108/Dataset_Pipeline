@@ -1,6 +1,5 @@
 from loguru import logger
 
-
 def run_multi_tube_assignment_gate() -> str:
     """Prompt whether multi-capture frame contains same or different tube types."""
     while True:
@@ -192,6 +191,41 @@ def run_multi_slot_gate(
         logger.info("Slot mapping: right-to-left (reversed to match detector order)")
     else:
         logger.info("Slot mapping: left-to-right")
+
+    return slots
+
+
+def run_same_multi_fill_gate() -> list[dict]:
+    """Prompt operator for per-slot fill levels in same-class multi-tube mode.
+
+    Asks how many tubes are in the frame, then collects a fill level for each
+    slot in left-to-right (x-sorted) order.
+
+    Returns:
+        List of slot dicts: [{"slot": 0, "fill_level": {...}}, ...]
+    """
+    n_slots: int | None = None
+    for attempt in range(2):
+        raw = input("Number of tube slots in frame: ").strip()
+        if raw.isdigit():
+            val = int(raw)
+            if 1 <= val <= 16:
+                n_slots = val
+                break
+        if attempt == 0:
+            print("  Invalid. Enter an integer between 1 and 16.")
+
+    if n_slots is None:
+        raise ValueError("Invalid slot count")
+
+    logger.info(f"Same-class multi-slot: {n_slots} slots")
+
+    slots: list[dict] = []
+    for i in range(n_slots):
+        print(f"\nSlot {i} —")
+        fill_level = _prompt_fill_level()
+        slots.append({"slot": i, "fill_level": fill_level})
+        logger.info(f"  Slot {i}: fill={fill_level['level']}")
 
     return slots
 
