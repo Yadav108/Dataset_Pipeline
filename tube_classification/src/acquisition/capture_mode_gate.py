@@ -53,6 +53,21 @@ def _prompt_volume_selection(available_tubes: list[dict]) -> tuple[float, list[d
         return (volume_ml, matched)
 
 
+def _prompt_fill_level() -> dict:
+    """Prompt operator for fill level and return a metadata-ready dict."""
+    level_map = {
+        "f": ("full",  "operator_declared", 0.0),
+        "h": ("half",  "operator_declared", 0.5),
+        "e": ("empty", "operator_declared", 1.0),
+    }
+    while True:
+        raw = input("  Fill level [F]ull / [H]alf / [E]mpty: ").strip().lower()
+        if raw in level_map:
+            level, confidence, boundary_ratio = level_map[raw]
+            return {"level": level, "confidence": confidence, "boundary_ratio": boundary_ratio}
+        print("  Invalid. Enter F, H, or E.")
+
+
 def _prompt_class_selection(matched_tubes: list[dict]) -> str:
     """Prompt operator to select a tube class from matched candidates.
 
@@ -115,7 +130,9 @@ def run_multi_slot_gate(
     Returns:
         List of slot dicts ordered to match detector x-sorted order
         (left-to-right):
-        [{"slot": 0, "volume_ml": 4.0, "class_id": "VAC_LIGHT_BLUE"}, ...]
+        [{"slot": 0, "volume_ml": 4.0, "class_id": "VAC_LIGHT_BLUE",
+          "fill_level": {"level": "empty", "confidence": "operator_declared",
+                         "boundary_ratio": 1.0}}, ...]
 
     Raises:
         ValueError: If operator enters an invalid slot count on both attempts.
@@ -151,14 +168,22 @@ def run_multi_slot_gate(
             break
         print("  Invalid. Enter 1 or 2.")
 
-    # Step 3 — per-slot volume + class
+    # Step 3 — per-slot volume, class, and fill level
     slots: list[dict] = []
     for i in range(n_slots):
         print(f"\nSlot {i} —")
         volume_ml, matched = _prompt_volume_selection(available_tubes)
         class_id = _prompt_class_selection(matched)
-        slots.append({"slot": i, "volume_ml": volume_ml, "class_id": class_id})
-        logger.info(f"  Slot {i}: {class_id} / {volume_ml}ml")
+        fill_level = _prompt_fill_level()
+        slots.append({
+            "slot": i,
+            "volume_ml": volume_ml,
+            "class_id": class_id,
+            "fill_level": fill_level,
+        })
+        logger.info(
+            f"  Slot {i}: {class_id} / {volume_ml}ml / fill={fill_level['level']}"
+        )
 
     if slot_direction == "rtl":
         slots = list(reversed(slots))
