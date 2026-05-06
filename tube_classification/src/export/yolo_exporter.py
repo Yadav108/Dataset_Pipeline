@@ -45,8 +45,15 @@ class YOLOExporter:
             try:
                 with open(metadata_file, "r") as f:
                     metadata = json.load(f)
-                class_id = metadata["class_id"]
-                unique_classes.add(class_id)
+                instances = metadata.get("instances")
+                if isinstance(instances, list) and instances:
+                    for instance in instances:
+                        class_id = instance.get("class_id")
+                        if class_id:
+                            unique_classes.add(class_id)
+                else:
+                    class_id = metadata["class_id"]
+                    unique_classes.add(class_id)
             except Exception:
                 continue
         
@@ -69,41 +76,59 @@ class YOLOExporter:
                 
                 # Extract fields
                 image_id = metadata["image_id"]
-                class_id = metadata["class_id"]
-                bbox_data = metadata["bbox"]
                 image_shape = metadata["image_shape"]
+                instances = metadata.get("instances")
+                session_id = metadata_file.parent.name
+                class_dir = metadata_file.parent.parent.name
                 
                 # Get image dimensions
                 img_w = image_shape["width"]
                 img_h = image_shape["height"]
-                
-                # Extract bbox
-                x = bbox_data["x"]
-                y = bbox_data["y"]
-                w = bbox_data["w"]
-                h = bbox_data["h"]
-                
-                # Normalize to YOLO format
-                cx = (x + w / 2) / img_w
-                cy = (y + h / 2) / img_h
-                nw = w / img_w
-                nh = h / img_h
-                
-                # Get class index
-                class_index = class_to_index[class_id]
-                
+
+                label_lines = []
+                if isinstance(instances, list) and instances:
+                    for instance in instances:
+                        class_id = instance.get("class_id")
+                        bbox_data = instance.get("bbox", {})
+                        if not class_id:
+                            continue
+                        x = bbox_data.get("x", 0)
+                        y = bbox_data.get("y", 0)
+                        w = bbox_data.get("w", 0)
+                        h = bbox_data.get("h", 0)
+                        cx = (x + w / 2) / img_w
+                        cy = (y + h / 2) / img_h
+                        nw = w / img_w
+                        nh = h / img_h
+                        class_index = class_to_index[class_id]
+                        label_lines.append(
+                            f"{class_index} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}"
+                        )
+                else:
+                    class_id = metadata["class_id"]
+                    bbox_data = metadata["bbox"]
+                    x = bbox_data["x"]
+                    y = bbox_data["y"]
+                    w = bbox_data["w"]
+                    h = bbox_data["h"]
+                    cx = (x + w / 2) / img_w
+                    cy = (y + h / 2) / img_h
+                    nw = w / img_w
+                    nh = h / img_h
+                    class_index = class_to_index[class_id]
+                    label_lines.append(
+                        f"{class_index} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}"
+                    )
+
                 # Write label file
                 label_file = labels_dir / f"{image_id}.txt"
                 with open(label_file, "w") as f:
-                    f.write(
-                        f"{class_index} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}\n"
-                    )
+                    f.write("\n".join(label_lines) + ("\n" if label_lines else ""))
                 
                 # Find and copy RGB image
-                session_id = metadata_file.parent.name
                 rgb_src = (
                     cleaned_raw_root
-                    / class_id
+                    / class_dir
                     / session_id
                     / f"{image_id}_rgb.png"
                 )

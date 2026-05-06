@@ -46,53 +46,86 @@ class ManifestBuilder:
                 
                 # Extract fields
                 image_id = metadata["image_id"]
-                class_id = metadata["class_id"]
-                volume_ml = metadata["volume_ml"]
-                coverage_ratio = metadata["coverage_ratio"]
-                bbox = metadata["bbox"]
-                # Optional: sam_iou_score (may not be present in older metadata)
-                sam_iou_score = metadata.get("sam_iou_score", None)
+                instances = metadata.get("instances")
                 
                 # Derive session_id from parent folder path
                 session_id = metadata_file.parent.name
+                class_dir = metadata_file.parent.parent.name
                 
                 # Build relative paths
                 rgb_path = (
                     cleaned_raw_root
-                    / class_id
+                    / class_dir
                     / session_id
                     / f"{image_id}_rgb.png"
                 )
                 depth_path = (
                     cleaned_raw_root
-                    / class_id
+                    / class_dir
                     / session_id
                     / f"{image_id}_depth.npy"
                 )
-                mask_path = (
-                    cleaned_ann_root
-                    / class_id
-                    / session_id
-                    / f"{image_id}_mask.png"
-                )
-                
-                # Build row
-                row = {
-                    "image_id": image_id,
-                    "class_id": class_id,
-                    "volume_ml": volume_ml,
-                    "session_id": session_id,
-                    "rgb_path": str(rgb_path),
-                    "depth_path": str(depth_path),
-                    "mask_path": str(mask_path),
-                    "bbox_x": bbox["x"],
-                    "bbox_y": bbox["y"],
-                    "bbox_w": bbox["w"],
-                    "bbox_h": bbox["h"],
-                    "coverage_ratio": coverage_ratio,
-                    "sam_iou_score": sam_iou_score,
-                }
-                rows.append(row)
+
+                if isinstance(instances, list) and instances:
+                    for instance in instances:
+                        class_id = instance.get("class_id", class_dir)
+                        volume_ml = instance.get("volume_ml", metadata.get("volume_ml"))
+                        coverage_ratio = instance.get("coverage_ratio", metadata.get("coverage_ratio", 0.0))
+                        bbox = instance.get("bbox", {})
+                        sam_iou_score = instance.get("sam_iou_score", None)
+                        mask_file = instance.get("mask_file", f"{image_id}_mask.png")
+                        mask_path = (
+                            cleaned_ann_root
+                            / class_dir
+                            / session_id
+                            / mask_file
+                        )
+
+                        row = {
+                            "image_id": image_id,
+                            "class_id": class_id,
+                            "volume_ml": volume_ml,
+                            "session_id": session_id,
+                            "rgb_path": str(rgb_path),
+                            "depth_path": str(depth_path),
+                            "mask_path": str(mask_path),
+                            "bbox_x": bbox.get("x", 0),
+                            "bbox_y": bbox.get("y", 0),
+                            "bbox_w": bbox.get("w", 0),
+                            "bbox_h": bbox.get("h", 0),
+                            "coverage_ratio": coverage_ratio,
+                            "sam_iou_score": sam_iou_score,
+                        }
+                        rows.append(row)
+                else:
+                    class_id = metadata["class_id"]
+                    volume_ml = metadata["volume_ml"]
+                    coverage_ratio = metadata["coverage_ratio"]
+                    bbox = metadata["bbox"]
+                    sam_iou_score = metadata.get("sam_iou_score", None)
+                    mask_path = (
+                        cleaned_ann_root
+                        / class_id
+                        / session_id
+                        / f"{image_id}_mask.png"
+                    )
+
+                    row = {
+                        "image_id": image_id,
+                        "class_id": class_id,
+                        "volume_ml": volume_ml,
+                        "session_id": session_id,
+                        "rgb_path": str(rgb_path),
+                        "depth_path": str(depth_path),
+                        "mask_path": str(mask_path),
+                        "bbox_x": bbox["x"],
+                        "bbox_y": bbox["y"],
+                        "bbox_w": bbox["w"],
+                        "bbox_h": bbox["h"],
+                        "coverage_ratio": coverage_ratio,
+                        "sam_iou_score": sam_iou_score,
+                    }
+                    rows.append(row)
             
             except Exception as e:
                 logger.warning(f"Failed to process {metadata_file.name}: {e}")
