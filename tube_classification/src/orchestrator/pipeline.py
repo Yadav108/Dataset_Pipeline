@@ -19,6 +19,7 @@ from src.acquisition.capture_mode_gate import (
     run_capture_mode_gate,
     run_multi_slot_gate,
     run_multi_tube_assignment_gate,
+    run_same_multi_fill_gate,
 )
 from src.acquisition.pipeline_integration import PreprocessingPipeline
 from src.annotation.roi_extractor import DepthROIExtractor
@@ -1107,6 +1108,8 @@ def run_pipeline(
             available_tubes=slot_available_tubes,
             cfg=cfg,
         )
+    elif capture_mode in {"multi_side", "multi_top"} and multi_tube_assignment == "same":
+        slot_declarations = run_same_multi_fill_gate()
     else:
         slot_declarations = None
     camera_angle_deg = run_camera_angle_gate()
