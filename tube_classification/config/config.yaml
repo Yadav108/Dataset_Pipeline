@@ -138,7 +138,7 @@ preprocessing:
     max_processing_time_ms: 500.0
 
 depth_mask_refiner:
-  enabled: true
+  enabled: false
   depth_band_tolerance_mm: 40.0
   depth_sample_region_ratio: 0.30
   zero_depth_support_kernel_size: 9
