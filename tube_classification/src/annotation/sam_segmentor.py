@@ -552,6 +552,7 @@ class SAMSegmentor:
                 [x1 + int(w * 0.20), y1 + int(h * 0.82)],
                 [x1 + int(w * 0.80), y1 + int(h * 0.82)],
                 [x1 + int(w * 0.10), y1 + int(h * 0.95)],
+                [x1 + w // 2,        y1 + int(h * 0.90)],  # center-bottom: holder contact zone
                 [x1 + int(w * 0.90), y1 + int(h * 0.95)],
             ], dtype=np.float32)
 
@@ -570,7 +571,7 @@ class SAMSegmentor:
         sam_mask: np.ndarray,
         depth_frame: np.ndarray,
         bbox: tuple[int, int, int, int],
-        tolerance_mm: int = 40,
+        tolerance_mm: int = 25,   # tightened from 40mm — holder sits >25mm from tube body
     ) -> np.ndarray:
         """Intersect SAM mask with a depth band sampled from the tube body.
 
@@ -641,6 +642,144 @@ class SAMSegmentor:
         if best_label == -1:
             return mask
         return (labels == best_label).astype(np.uint8) * 255
+
+    @staticmethod
+    def trim_bottom_holder_contact(
+        mask: np.ndarray,
+        bbox: tuple[int, int, int, int],
+    ) -> tuple[np.ndarray, int]:
+        """Trim bottom-attached holder region when it blooms wider than tube body.
+        
+        Detects when the bottom of the mask widens significantly (holder bleed-through)
+        and trims it while preserving the main tube body. This is particularly important
+        for side-view captures where the holder can extend into the mask region.
+        
+        Args:
+            mask: Binary mask (0/255, uint8) from SAM
+            bbox: Bounding box as (x, y, w, h)
+            
+        Returns:
+            Tuple of (trimmed_mask, pixels_removed)
+        """
+        _, _, w, h = bbox
+        
+        # Only apply if tube is tall and narrow (side-view characteristic)
+        if h < int(1.35 * w):
+            return mask, 0
+        
+        rows = np.where(mask.any(axis=1))[0]
+        if len(rows) < 24:
+            return mask, 0
+        
+        y0 = int(rows[0])
+        y1 = int(rows[-1])
+        span = y1 - y0 + 1
+        if span < 26:
+            return mask, 0
+        
+        # Measure width profile
+        row_widths = np.count_nonzero(mask > 0, axis=1).astype(np.int32)
+        
+        # Sample upper portion (tube body, not holder)
+        lower_band_start = y0 + int(0.62 * span)
+        upper_rows = np.arange(y0, max(y0 + 1, lower_band_start), dtype=np.int32)
+        upper_rows = upper_rows[row_widths[upper_rows] > 0]
+        if len(upper_rows) < 8:
+            return mask, 0
+        
+        # Core tube width
+        core_width = float(np.median(row_widths[upper_rows]))
+        if core_width < 6.0:
+            return mask, 0
+        
+        # Detect bloom (sudden widening at bottom)
+        bloom_threshold = max(core_width * 1.48, core_width + 12.0)
+        cut_start = None
+        run = 0
+        
+        for yy in range(y1, lower_band_start - 1, -1):
+            if row_widths[yy] >= bloom_threshold:
+                run += 1
+            else:
+                if run >= 3:
+                    cut_start = yy + 1
+                    break
+                run = 0
+        
+        if cut_start is None and run >= 3:
+            cut_start = lower_band_start
+        if cut_start is None:
+            return mask, 0
+        
+        trimmed = mask.copy()
+        trimmed[cut_start:y1 + 1, :] = 0
+        
+        removed = int(np.count_nonzero(mask) - np.count_nonzero(trimmed))
+        return trimmed, removed
+
+    def remove_holder_by_depth(
+        self,
+        mask: np.ndarray,
+        depth_frame: np.ndarray,
+        bbox: tuple[int, int, int, int],
+    ) -> tuple[np.ndarray, int]:
+        """Remove holder pixels by building a tight depth band around the tube body.
+
+        Samples the upper 50% of the bbox (tube body, not holder) to estimate
+        the tube's median depth, then retains only mask pixels within ±30mm of
+        that depth. This is tighter than the global config range (140mm) and
+        works across all capture angles.
+        """
+        x, y, w, h = bbox
+
+        # Sample upper 50% of bbox — tube body lives here, holder does not
+        sample_h = int(h * 0.50)
+        tube_region = depth_frame[y:y + sample_h, x:x + w].astype(np.float32)
+        valid = tube_region[(tube_region > 100) & (tube_region < 60000)]
+
+        if len(valid) < 10:
+            logger.debug(
+                "[remove_holder_by_depth] Insufficient depth samples, skipping"
+            )
+            return mask, 0
+
+        median_depth = float(np.median(valid))
+        tolerance_mm = 30.0  # tighter than filter_mask_by_tube_depth's 40mm
+
+        depth_band = (
+            (depth_frame >= median_depth - tolerance_mm)
+            & (depth_frame <= median_depth + tolerance_mm)
+        ).astype(np.uint8) * 255
+
+        refined = cv2.bitwise_and(mask, depth_band)
+
+        # Safety: if result too small, return original
+        refined_area = cv2.countNonZero(refined)
+        original_area = cv2.countNonZero(mask)
+        if refined_area < max(50, int(0.40 * original_area)):
+            logger.debug(
+                f"[remove_holder_by_depth] Result too small "
+                f"({refined_area}/{original_area}px), returning original"
+            )
+            return mask, 0
+
+        # Reconnect any fragmented tube body
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(refined, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            cv2.drawContours(refined, [largest], 0, 255, -1)
+
+        removed = int(original_area - cv2.countNonZero(refined))
+        logger.debug(
+            f"[remove_holder_by_depth] median_depth={median_depth:.0f}mm, "
+            f"band=[{median_depth - tolerance_mm:.0f}, {median_depth + tolerance_mm:.0f}]mm, "
+            f"removed={removed}px"
+        )
+        return refined, removed
+
 
     def segment(
         self,
@@ -803,12 +942,44 @@ class SAMSegmentor:
             largest_contour = max(contours, key=cv2.contourArea)
             cv2.drawContours(mask, [largest_contour], 0, 255, -1)
 
+        # ─────────────────────────────────────────────────────────────
+        # STEP 3a: ROBUST HOLDER REMOVAL USING DEPTH (angle-agnostic)
+        # ─────────────────────────────────────────────────────────────
+        # Use depth-based filtering which works across ALL capture angles
+        if depth_frame is not None:
+            pre_holder_area = cv2.countNonZero(mask)
+            mask, holder_removed = self.remove_holder_by_depth(mask, depth_frame, (x, y, w, h))
+            post_holder_area = cv2.countNonZero(mask)
+            
+            if holder_removed > 0:
+                logger.debug(
+                    f"Holder removal (depth-based): {pre_holder_area} → {post_holder_area}px² "
+                    f"({holder_removed}px removed)"
+                )
+        else:
+            # Fallback to simple bloom detection if no depth available
+            mask, holder_removed = self.trim_bottom_holder_contact(mask, (x, y, w, h))
+            if holder_removed > 0:
+                logger.debug(
+                    f"Holder removal (width-profile fallback): {holder_removed}px removed"
+                )
+
         # Keep only connected-component isolation here.
         # Width-based cuts were over-trimming wider tubes (e.g., 10ml) and
         # collapsing the downstream rembg crop.
         mask, removed_blob_pixels = self._select_tube_component(mask, (x, y, w, h))
         if removed_blob_pixels > 0:
             logger.debug(f"SAM blob-prune applied: removed_pixels={removed_blob_pixels}")
+
+        # Trim bottom holder bloom (width-profile based)
+        mask, trim_removed = self._trim_bottom_holder_contact(mask, (x, y, w, h))
+        if trim_removed > 0:
+            logger.debug(f"Bottom holder trim applied: removed_pixels={trim_removed}")
+
+        # Clamp lower over-wide regions to tube-like vertical profile
+        mask, profile_removed = self._enforce_tube_profile(mask, (x, y, w, h))
+        if profile_removed > 0:
+            logger.debug(f"Tube profile enforcement applied: removed_pixels={profile_removed}")
 
         # ─────────────────────────────────────────────────────────────
         # STEP 3a: DEPTH INTERSECTION — remove holder pixels at a different depth
@@ -962,6 +1133,7 @@ class SAMSegmentor:
         )
         
         iou_score = float(scores[0])
+        
         mask = masks[0].astype(np.uint8) * 255
         
         logger.debug(f"SAM 5-point initial: IoU={iou_score:.3f}, area={cv2.countNonZero(mask)}px²")
@@ -1050,4 +1222,5 @@ class SAMSegmentor:
         )
         
         return (mask, iou_score)
+
 

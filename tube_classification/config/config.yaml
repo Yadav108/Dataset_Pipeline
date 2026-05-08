@@ -1,7 +1,7 @@
 # Camera configuration: resolution, frame rate, and depth sensor range
 # Depth stream: 848×480@30fps (confirmed stable)
 # Color stream: 1920×1080@30fps (highest D435i RGB resolution)
-# TUNED FOR: 22cm camera-to-tube distance
+# TUNED FOR: 30-40cm camera-to-tube distance (side ~30-32cm, angled ~40cm)
 camera:
   width: 848            # Depth stream resolution (stable)
   height: 480           # Depth stream resolution (stable)
@@ -9,8 +9,8 @@ camera:
   color_width: 1920     # Highest RGB resolution on D435i
   color_height: 1080
   color_fps: 30
-  depth_min_m: 0.17    # 22cm - 5cm margin
-  depth_max_m: 0.27    # 22cm + 5cm margin
+  depth_min_m: 0.28    # 30-40cm working distance: 28cm (allows 20-22mm holder offset)
+  depth_max_m: 0.42    # 30-40cm working distance: 42cm (accounts for angled at ~40cm + margin)
   sensor_options:
     controls-color-exposure: 156   
     controls-color-white-balance-auto: false   # white balance
