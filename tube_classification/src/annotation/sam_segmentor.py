@@ -552,6 +552,7 @@ class SAMSegmentor:
                 [x1 + int(w * 0.20), y1 + int(h * 0.82)],
                 [x1 + int(w * 0.80), y1 + int(h * 0.82)],
                 [x1 + int(w * 0.10), y1 + int(h * 0.95)],
+                [x1 + w // 2,        y1 + int(h * 0.90)],  # center-bottom: holder contact zone
                 [x1 + int(w * 0.90), y1 + int(h * 0.95)],
             ], dtype=np.float32)
 
@@ -570,7 +571,7 @@ class SAMSegmentor:
         sam_mask: np.ndarray,
         depth_frame: np.ndarray,
         bbox: tuple[int, int, int, int],
-        tolerance_mm: int = 40,
+        tolerance_mm: int = 25,   # tightened from 40mm — holder sits >25mm from tube body
     ) -> np.ndarray:
         """Intersect SAM mask with a depth band sampled from the tube body.
 
@@ -716,82 +717,67 @@ class SAMSegmentor:
         removed = int(np.count_nonzero(mask) - np.count_nonzero(trimmed))
         return trimmed, removed
 
-    @staticmethod
     def remove_holder_by_depth(
+        self,
         mask: np.ndarray,
         depth_frame: np.ndarray,
         bbox: tuple[int, int, int, int],
     ) -> tuple[np.ndarray, int]:
-        """Remove holder pixels using depth segmentation (angle-agnostic).
-        
-        This method works across all capture angles (side, angled, top) by using
-        depth to distinguish tube body from holder stand. The key insight is that
-        holders are always at a different depth plane than the tube they support.
-        
-        Strategy:
-        1. Sample depth from mask regions (avoid holder-heavy areas)
-        2. Estimate tube depth distribution (mean ± std)
-        3. Aggressively filter out pixels at different depths (holders, shadows)
-        4. Use morphology to reconnect tube body after aggressive filtering
-        
-        Args:
-            mask: Binary mask (0/255, uint8) from SAM
-            depth_frame: Raw depth frame (uint16, mm units)
-            bbox: Bounding box as (x, y, w, h)
-            
-        Returns:
-            Tuple of (refined_mask, pixels_removed)
+        """Remove holder pixels by building a tight depth band around the tube body.
+
+        Samples the upper 50% of the bbox (tube body, not holder) to estimate
+        the tube's median depth, then retains only mask pixels within ±30mm of
+        that depth. This is tighter than the global config range (140mm) and
+        works across all capture angles.
         """
         x, y, w, h = bbox
-        
-        # Sample depth from MIDDLE region of mask (likely tube, less likely holder)
-        # This is angle-agnostic: middle = center of depth cloud regardless of orientation
-        mid_start = y + int(0.25 * h)
-        mid_end = y + int(0.75 * h)
-        
-        if mid_end <= mid_start or mid_end > depth_frame.shape[0]:
+
+        # Sample upper 50% of bbox — tube body lives here, holder does not
+        sample_h = int(h * 0.50)
+        tube_region = depth_frame[y:y + sample_h, x:x + w].astype(np.float32)
+        valid = tube_region[(tube_region > 100) & (tube_region < 60000)]
+
+        if len(valid) < 10:
+            logger.debug(
+                "[remove_holder_by_depth] Insufficient depth samples, skipping"
+            )
             return mask, 0
-        
-        # Get valid depth samples from middle region
-        mid_region_depth = depth_frame[mid_start:mid_end, x:x+w]
-        mask_mid_region = mask[mid_start:mid_end, x:x+w]
-        
-        # Sample only where mask is present
-        valid_depths = mid_region_depth[mask_mid_region > 0]
-        valid_depths = valid_depths[(valid_depths > 100) & (valid_depths < 60000)]
-        
-        if len(valid_depths) < 20:
-            return mask, 0
-        
-        # Estimate tube depth statistics
-        tube_depth_mean = float(np.mean(valid_depths))
-        tube_depth_std = float(np.std(valid_depths))
-        
-        # Conservative threshold: keep pixels within mean ± 1.5×std
-        # This is robust to transparent tubes with slight depth variations
-        depth_lo = tube_depth_mean - 1.5 * tube_depth_std
-        depth_hi = tube_depth_mean + 1.5 * tube_depth_std
-        
-        # Create aggressive depth mask (only pixels at tube depth)
-        depth_mask = (
-            (depth_frame >= depth_lo) & (depth_frame <= depth_hi)
+
+        median_depth = float(np.median(valid))
+        tolerance_mm = 30.0  # tighter than filter_mask_by_tube_depth's 40mm
+
+        depth_band = (
+            (depth_frame >= median_depth - tolerance_mm)
+            & (depth_frame <= median_depth + tolerance_mm)
         ).astype(np.uint8) * 255
-        
-        # Intersect with SAM mask
-        refined = cv2.bitwise_and(mask, depth_mask)
-        
-        # Reconnect tube body with morphological closing
-        # Use larger kernel to bridge gaps created by aggressive filtering
+
+        refined = cv2.bitwise_and(mask, depth_band)
+
+        # Safety: if result too small, return original
+        refined_area = cv2.countNonZero(refined)
+        original_area = cv2.countNonZero(mask)
+        if refined_area < max(50, int(0.40 * original_area)):
+            logger.debug(
+                f"[remove_holder_by_depth] Result too small "
+                f"({refined_area}/{original_area}px), returning original"
+            )
+            return mask, 0
+
+        # Reconnect any fragmented tube body
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kernel, iterations=2)
-        
-        # Fill any interior holes
+
         contours, _ = cv2.findContours(refined, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             largest = max(contours, key=cv2.contourArea)
             cv2.drawContours(refined, [largest], 0, 255, -1)
-        
-        removed = int(np.count_nonzero(mask) - np.count_nonzero(refined))
+
+        removed = int(original_area - cv2.countNonZero(refined))
+        logger.debug(
+            f"[remove_holder_by_depth] median_depth={median_depth:.0f}mm, "
+            f"band=[{median_depth - tolerance_mm:.0f}, {median_depth + tolerance_mm:.0f}]mm, "
+            f"removed={removed}px"
+        )
         return refined, removed
 
 
@@ -960,6 +946,16 @@ class SAMSegmentor:
         if removed_blob_pixels > 0:
             logger.debug(f"SAM blob-prune applied: removed_pixels={removed_blob_pixels}")
 
+        # Trim bottom holder bloom (width-profile based)
+        mask, trim_removed = self._trim_bottom_holder_contact(mask, (x, y, w, h))
+        if trim_removed > 0:
+            logger.debug(f"Bottom holder trim applied: removed_pixels={trim_removed}")
+
+        # Clamp lower over-wide regions to tube-like vertical profile
+        mask, profile_removed = self._enforce_tube_profile(mask, (x, y, w, h))
+        if profile_removed > 0:
+            logger.debug(f"Tube profile enforcement applied: removed_pixels={profile_removed}")
+
         # ─────────────────────────────────────────────────────────────
         # STEP 3a: DEPTH INTERSECTION — remove holder pixels at a different depth
         # ─────────────────────────────────────────────────────────────
@@ -1099,6 +1095,7 @@ class SAMSegmentor:
         )
         
         iou_score = float(scores[0])
+        
         mask = masks[0].astype(np.uint8) * 255
         
         logger.debug(f"SAM 5-point initial: IoU={iou_score:.3f}, area={cv2.countNonZero(mask)}px²")
