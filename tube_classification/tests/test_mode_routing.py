@@ -13,6 +13,10 @@ class _DummyExtractor:
         self.calls.append(("extract_top", depth_frame))
         return (5, 6, 7, 8)
 
+    def extract_multi_side(self, depth_frame):
+        self.calls.append(("extract_multi_side", depth_frame))
+        return [(17, 18, 19, 20), (21, 22, 23, 24)]
+
     def extract_multi_top(self, depth_frame):
         self.calls.append(("extract_multi_top", depth_frame))
         return [(9, 10, 11, 12), (13, 14, 15, 16)]
@@ -36,6 +40,16 @@ def test_single_top_uses_extract_top():
 
     assert bboxes == [(5, 6, 7, 8)]
     assert extractor.calls == [("extract_top", depth_frame)]
+
+
+def test_multi_side_uses_extract_multi_side():
+    depth_frame = object()
+    extractor = _DummyExtractor()
+
+    bboxes = extract_bboxes_for_mode("multi_side", extractor, depth_frame)
+
+    assert bboxes == [(17, 18, 19, 20), (21, 22, 23, 24)]
+    assert extractor.calls == [("extract_multi_side", depth_frame)]
 
 
 def test_multi_top_uses_extract_multi_top():

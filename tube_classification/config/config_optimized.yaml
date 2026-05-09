@@ -8,7 +8,7 @@ camera:
 
 # Storage configuration: data directory paths and session naming
 storage:
-  root_dir: dataset/raw
+  root_dir: dataset
   registry_path: config/registry.yaml
   sam_weights_path: models/mobile_sam.pt
   session_prefix: session

@@ -1,3 +1,4 @@
+import json
 import uuid
 import datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ from src.acquisition.fill_level_detector import (
 from src.acquisition.stability_detector import DepthStabilityDetector
 from src.acquisition.distance_calibrator import DistanceCalibrator
 from src.acquisition.volume_gate import run_volume_gate
-from src.acquisition.capture_mode_gate import run_capture_mode_gate
+from src.acquisition.capture_mode_gate import run_capture_mode_gate, run_multi_side_slot_gate
 from src.acquisition.pipeline_integration import PreprocessingPipeline
 from src.annotation.roi_extractor import DepthROIExtractor
 from src.annotation.sam_segmentor import SAMSegmentor
@@ -162,6 +163,8 @@ def _process_roi(
     is_inverted: bool = False,
     fill_level_result: FillLevelResult | None = None,
     intrinsics: object = None,
+    slot_index: int | None = None,
+    slot_count: int | None = None,
 ) -> tuple[bool, float | None]:
     """Process a single ROI through segmentation, annotation, and cleaning.
     
@@ -373,6 +376,10 @@ def _process_roi(
             "depth_variance": float(getattr(quality_metrics, "depth_variance", 0.0)),
             "quality_score": float(getattr(quality_metrics, "quality_score", 0.0)),
         }
+    if slot_index is not None:
+        metadata["slot_index"] = int(slot_index)
+    if slot_count is not None:
+        metadata["slot_count"] = int(slot_count)
     
     raw_dir = root / "raw" / class_id / session_id
     ann_dir = root / "annotations" / class_id / session_id
@@ -562,29 +569,70 @@ def run_pipeline(
         volume_ml = preselected_volume_ml
         matched_tubes = [{"class_id": preselected_class_id}] if preselected_class_id else []
 
-    session_fill_level_result = _prompt_fill_level_declaration()
-    if session_fill_level_result is None:
-        logger.info("Operator canceled before capture-mode selection.")
-        return
-
     capture_mode = preselected_capture_mode or run_capture_mode_gate()
+
+    session_fill_level_result: FillLevelResult | None = None
+    if capture_mode != "multi_side":
+        session_fill_level_result = _prompt_fill_level_declaration()
+        if session_fill_level_result is None:
+            logger.info("Operator canceled before capture setup.")
+            return
     
     session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # Handle class selection — NEW: Interactive prompt
-    class_id = preselected_class_id or _select_tube_class(matched_tubes)
+    root = Path(cfg.storage.root_dir)
+    session_banner = (
+        f"\n{'=' * 70}\n"
+        f"CAPTURE SESSION ID: {session_id}\n"
+        f"CAPTURE MODE:       {capture_mode}\n"
+        f"STORAGE ROOT:       {root.resolve()}\n"
+        f"RAW ROOT:           {(root / 'raw').resolve()}\n"
+        f"ANNOTATION ROOT:    {(root / 'annotations').resolve()}\n"
+        f"CLEANED ROOT:       {(root / 'cleaned').resolve()}\n"
+        f"{'=' * 70}"
+    )
+    print(session_banner)
+    logger.info(session_banner)
+
+    # Multi-side: declare per-slot class + fill level before capture starts
+    multi_side_slots: list[dict] | None = None
+    if capture_mode == "multi_side":
+        multi_side_slots = run_multi_side_slot_gate()
+        # class_id is unused in multi_side; use first slot as nominal label.
+        class_id = multi_side_slots[0]["class_id"]
+        slot_manifest = [
+            {
+                "slot_index": idx,
+                "class_id": slot["class_id"],
+                "volume_ml": slot["volume_ml"],
+                "fill_level": slot["fill_level_result"].level.value,
+                "fill_confidence": slot["fill_level_result"].confidence,
+                "fill_boundary_ratio": float(slot["fill_level_result"].boundary_ratio),
+            }
+            for idx, slot in enumerate(multi_side_slots)
+        ]
+        slot_manifest_dir = root / "session_slots"
+        slot_manifest_dir.mkdir(parents=True, exist_ok=True)
+        slot_manifest_path = slot_manifest_dir / f"{session_id}_multi_side_slots.json"
+        with open(slot_manifest_path, "w") as f:
+            json.dump(slot_manifest, f, indent=2)
+        print(f"Multi-side slot file: {slot_manifest_path.resolve()}")
+        logger.info(f"Multi-side slot file: {slot_manifest_path.resolve()}")
+        logger.info(f"Multi-side slots declared: {slot_manifest}")
+    else:
+        class_id = preselected_class_id or _select_tube_class(matched_tubes)
     
     logger.info(
         f"Session started: {session_id} | class={class_id} | volume={volume_ml}ml"
     )
-    logger.info(
-        f"Fill level declared for session: {session_fill_level_result.level.value} "
-        f"(confidence={session_fill_level_result.confidence}, "
-        f"boundary_ratio={session_fill_level_result.boundary_ratio:.3f})"
-    )
+    print(f"Session started: {session_id}")
+    if session_fill_level_result is not None:
+        logger.info(
+            f"Fill level declared for session: {session_fill_level_result.level.value} "
+            f"(confidence={session_fill_level_result.confidence}, "
+            f"boundary_ratio={session_fill_level_result.boundary_ratio:.3f})"
+        )
     
     # COUNT EXISTING IMAGES FOR THIS CLASS (crash recovery)
-    root = Path(cfg.storage.root_dir)
     class_raw_dir = root / "raw" / class_id
     existing_count = 0
     if class_raw_dir.exists():
@@ -723,6 +771,31 @@ def run_pipeline(
             last_known_roi = bboxes[0] if bboxes else None
             
             logger.debug(f"Frame {frame_count}: Extracted {len(bboxes)} ROI(s)")
+
+            if multi_side_slots is not None and len(bboxes) != len(multi_side_slots):
+                rejected_roi += len(bboxes)
+                last_rejection = f"ROI_COUNT {len(bboxes)}/{len(multi_side_slots)}"
+                rejection_frame_count = 0
+                logger.warning(
+                    f"Multi-side frame skipped: detected {len(bboxes)} ROI(s), "
+                    f"but {len(multi_side_slots)} slot(s) were declared. "
+                    f"Skipping frame to avoid wrong left-to-right class mapping."
+                )
+                stability_achieved = False
+                detector.reset()
+
+                if cfg.pipeline.show_preview:
+                    preview = _draw_preview_overlays(
+                        rgb_frame, bboxes[0], detector.consecutive_stable,
+                        cfg.pipeline.stability_frames, center_depth, depth_min, depth_max,
+                        session_captures, existing_count + session_captures + remaining,
+                        last_rejection, rejection_frame_count,
+                    )
+                    cv2.imshow("Tube Classification — Live Preview", preview)
+                    cv2.waitKey(1)
+
+                rejection_frame_count += 1
+                continue
             
             # Process each ROI independently
             root = Path(cfg.storage.root_dir)
@@ -730,18 +803,40 @@ def run_pipeline(
             first_bbox_for_preview = bboxes[0]  # For preview overlay
             
             for idx, bbox in enumerate(bboxes):
+                # Multi-side: each bbox maps to its declared slot left-to-right.
+                if multi_side_slots is not None:
+                    if idx >= len(multi_side_slots):
+                        logger.warning(
+                            f"Frame has {len(bboxes)} ROIs but only "
+                            f"{len(multi_side_slots)} slots declared; skipping bbox {idx}"
+                        )
+                        continue
+                    slot = multi_side_slots[idx]
+                    slot_class_id = slot["class_id"]
+                    slot_volume_ml = slot["volume_ml"]
+                    slot_fill_level = slot["fill_level_result"]
+                    slot_image_id = f"{slot_class_id}_{uuid.uuid4().hex[:8]}"
+                else:
+                    slot_class_id = class_id
+                    slot_volume_ml = volume_ml
+                    slot_fill_level = session_fill_level_result
+                    slot_image_id = None
+
                 success, iou_score = _process_roi(
                     rgb_frame, depth_frame, bbox,
-                    class_id, volume_ml, session_id,
+                    slot_class_id, slot_volume_ml, session_id,
                     segmentor, writer, blur_detector,
                     duplicate_remover, bbox_filter, background_remover,
                     cfg, root,
+                    image_id=slot_image_id,
                     preprocessing_pipeline=preprocessing_pipeline,
                     calibration_result=calibration_result,
                     orientation=frame_orientation,
                     is_inverted=frame_is_inverted,
-                    fill_level_result=session_fill_level_result,
+                    fill_level_result=slot_fill_level,
                     intrinsics=streamer,
+                    slot_index=idx if multi_side_slots is not None else None,
+                    slot_count=len(multi_side_slots) if multi_side_slots is not None else None,
                 )
                 
                 if success:
@@ -883,7 +978,6 @@ def run_pipeline(
                 logger.info("Generating Quality Constellation visualization...")
                 # Load metrics from written annotation metadata.
                 metrics_list = []
-                import json
                 from types import SimpleNamespace
                 metadata_root = Path(cfg.storage.root_dir) / "annotations"
                 for metadata_path in metadata_root.rglob("*_metadata.json"):
