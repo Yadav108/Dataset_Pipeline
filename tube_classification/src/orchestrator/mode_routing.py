@@ -7,6 +7,8 @@ def extract_bboxes_for_mode(
     depth_frame: Any,
 ) -> list[tuple[int, int, int, int]]:
     """Route ROI extraction to the correct extractor method by capture mode."""
+    if capture_mode == "multi_side":
+        return roi_extractor.extract_multi_side(depth_frame)
     if capture_mode == "multi_top":
         return roi_extractor.extract_multi_top(depth_frame)
     if capture_mode == "multi_side":

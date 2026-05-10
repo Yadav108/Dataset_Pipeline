@@ -176,6 +176,8 @@ class DepthROIExtractor:
         """
         self.cfg = get_config()
         self._depth_scale = depth_scale
+        self._debug_mask_saved = False
+        self._debug_nearest_saved = False
         self._last_bbox: tuple[int, int, int, int] | None = None
         self._orientation: str = 'side'
         self._is_inverted: bool = False
@@ -219,6 +221,20 @@ class DepthROIExtractor:
             & (depth_frame <= int(nearest_depth_mm + band_mm))
             & valid_mask
         ).astype(np.uint8) * 255
+
+        if not self._debug_nearest_saved:
+            try:
+                from pathlib import Path
+                depth_norm = cv2.normalize(
+                    depth_frame, None, 0, 255, cv2.NORM_MINMAX
+                ).astype(np.uint8)
+                depth_vis = cv2.cvtColor(depth_norm, cv2.COLOR_GRAY2BGR)
+                mask_vis = cv2.cvtColor(nearest_mask, cv2.COLOR_GRAY2BGR)
+                debug_combo = cv2.hconcat([depth_vis, mask_vis])
+                cv2.imwrite(str(Path("debug_nearest_mask.png")), debug_combo)
+                self._debug_nearest_saved = True
+            except Exception as e:
+                logger.debug(f"[DEBUG] Failed to save nearest debug image: {e}")
 
         return nearest_mask
     
@@ -300,6 +316,29 @@ class DepthROIExtractor:
 
             mask = cleaned
         
+        if not self._debug_mask_saved:
+            try:
+                from pathlib import Path
+                debug_path = Path("debug_mask.png")
+                cv2.imwrite(str(debug_path), mask)
+                
+                # Also save a depth visualization
+                depth_norm = cv2.normalize(
+                    depth_frame, None, 0, 255, cv2.NORM_MINMAX
+                ).astype(np.uint8)
+                if bool(getattr(self.cfg.pipeline, "depth_preview_invert", True)):
+                    cv2.bitwise_not(depth_norm, dst=depth_norm)
+                cv2.imwrite("debug_depth.png", depth_norm)
+                
+                nonzero_count = cv2.countNonZero(mask)
+                logger.debug(
+                    f"[DEBUG] Saved debug images: debug_mask.png, debug_depth.png "
+                    f"(nonzero pixels in mask: {nonzero_count})"
+                )
+                self._debug_mask_saved = True
+            except Exception as e:
+                logger.debug(f"[DEBUG] Failed to save debug images: {e}")
+        
         return mask
 
     def _single_side_param(self, key: str, default: float) -> float:
@@ -313,13 +352,18 @@ class DepthROIExtractor:
         h: int,
         area: float,
         solidity: float,
-        frame_shape: tuple[int, int]
+        frame_shape: tuple[int, int],
+        max_roi_area_ratio_override: float | None = None,
     ) -> bool:
         frame_h, frame_w = frame_shape
         area_ratio = area / float(frame_h * frame_w)
         width_ratio = w / float(frame_w)
         tray_max_area_ratio = self._single_side_param("single_side_tray_max_area_ratio", 0.22)
-        max_roi_area_ratio = self._single_side_param("single_side_max_roi_area_ratio", 0.012)
+        max_roi_area_ratio = (
+            float(max_roi_area_ratio_override)
+            if max_roi_area_ratio_override is not None
+            else self._single_side_param("single_side_max_roi_area_ratio", 0.012)
+        )
         tray_max_width_ratio = self._single_side_param("single_side_tray_max_width_ratio", 0.55)
         tray_min_solidity = self._single_side_param("single_side_tray_min_solidity", 0.92)
         bottom_tray_y_ratio = self._single_side_param("single_side_bottom_tray_y_ratio", 0.90)
@@ -736,7 +780,7 @@ class DepthROIExtractor:
                 max(float(self.cfg.pipeline.min_tube_length_px), 55.0),
             )
         mask = self._preprocess_depth(depth_frame, depth_min, depth_max, initial_mask=initial_mask)
-
+        
         # Step 2 — Find contours (RETR_EXTERNAL only)
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -1020,73 +1064,57 @@ class DepthROIExtractor:
         
         return (x, y, w, h)
 
-    def extract_multi(
-        self,
-        depth_frame: np.ndarray,
-        score_ratio: float | None = None,
-        iou_threshold: float | None = None,
-        expected_max: int | None = None,
-    ) -> list[tuple[int, int, int, int]]:
-        """Extract bounding boxes for multiple tubes (multi_side mode).
+    def extract_multi_side(self, depth_frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Extract bounding boxes for all tubes from side view (multi_side mode).
 
-        Runs the same candidate-building logic as extract() but returns all
-        candidates that survive a relative score floor and NMS, rather than
-        a single best result. Does not modify self._last_bbox or self._is_inverted.
+        Runs the same side-view depth mask and contour filters as ``extract()``,
+        but returns every passing candidate sorted left-to-right instead of only
+        the highest-scoring candidate.
 
         Args:
             depth_frame: Raw depth frame in uint16 format
-            score_ratio: Keep candidates with score >= ratio * best_score.
-                Defaults to cfg.pipeline.multi_roi_score_ratio.
-            iou_threshold: NMS IoU threshold above which a candidate is
-                suppressed. Defaults to cfg.pipeline.multi_roi_nms_iou_threshold.
-            expected_max: Warn if more ROIs than this are returned.
-                Defaults to cfg.pipeline.multi_roi_expected_max.
 
         Returns:
-            List of (x, y, width, height) tuples, possibly empty.
+            List of (x, y, width, height) tuples sorted by x coordinate.
+            Empty list if no valid ROIs found.
         """
-        if score_ratio is None:
-            score_ratio = self.cfg.pipeline.multi_roi_score_ratio
-        if iou_threshold is None:
-            iou_threshold = self.cfg.pipeline.multi_roi_nms_iou_threshold
-        if expected_max is None:
-            expected_max = self.cfg.pipeline.multi_roi_expected_max
-
-        # --- Candidate building (mirrors extract() Steps 0–3) ---
-
-        # Step 0 — Orientation (local only, no self._orientation side-effect)
         forced = getattr(self.cfg.pipeline, 'force_camera_orientation', None)
-        orientation = forced if forced else detect_camera_orientation(depth_frame)
-        logger.debug(f"[extract_multi] camera orientation={orientation}")
+        self._orientation = forced if forced else detect_camera_orientation(depth_frame)
+        orientation = self._orientation
+        logger.debug(f"[multi_side] camera orientation={orientation}")
 
-        # Step 1 — Preprocessing
         depth_min = self._single_side_param("single_side_depth_min_m", self.cfg.camera.depth_min_m)
         depth_max = self._single_side_param("single_side_depth_max_m", self.cfg.camera.depth_max_m)
 
+        self._is_inverted = False
         initial_mask: np.ndarray | None = None
         if orientation == 'angled':
             is_inverted, adj_near, adj_far = detect_depth_inversion(
                 depth_frame, depth_min, depth_max, self._depth_scale
             )
+            self._is_inverted = is_inverted
             if is_inverted:
                 logger.info(
-                    f"[extract_multi] Depth inversion detected — holder is closer than tube. "
-                    f"Adjusted depth gate: {adj_near:.3f}m–{adj_far:.3f}m "
-                    f"(original: {depth_min:.3f}m–{depth_max:.3f}m). "
+                    f"[multi_side] Depth inversion detected. "
+                    f"Adjusted depth gate: {adj_near:.3f}m-{adj_far:.3f}m "
+                    f"(original: {depth_min:.3f}m-{depth_max:.3f}m). "
                     f"Applying dual-zone subtraction."
                 )
-                holder_near_mm = depth_min / self._depth_scale
-                holder_far_mm = depth_max / self._depth_scale
-                tube_near_mm = adj_near / self._depth_scale
-                tube_far_mm = adj_far / self._depth_scale
                 initial_mask = create_depth_mask_dual_zone(
-                    depth_frame, tube_near_mm, tube_far_mm, holder_near_mm, holder_far_mm
+                    depth_frame,
+                    adj_near / self._depth_scale,
+                    adj_far / self._depth_scale,
+                    depth_min / self._depth_scale,
+                    depth_max / self._depth_scale,
                 )
+        is_inverted = self._is_inverted
 
         if orientation == 'angled':
             min_area_px = float(getattr(self.cfg.pipeline, 'angled_min_roi_area_px', 600))
             min_short_px = float(getattr(self.cfg.pipeline, 'angled_min_tube_dim_px', 20))
             min_long_px = float(getattr(self.cfg.pipeline, 'angled_min_tube_length_px', 40))
+            min_aspect_ratio = float(getattr(self.cfg.pipeline, 'angled_min_aspect_ratio', 1.05))
+            max_aspect_ratio = float(getattr(self.cfg.pipeline, 'angled_max_aspect_ratio', 5.0))
         else:
             min_area_px = self._single_side_param(
                 "single_side_min_roi_area_px",
@@ -1100,84 +1128,75 @@ class DepthROIExtractor:
                 "single_side_min_tube_length_px",
                 max(float(self.cfg.pipeline.min_tube_length_px), 55.0),
             )
-        mask = self._preprocess_depth(depth_frame, depth_min, depth_max, initial_mask=initial_mask)
+            min_aspect_ratio = self._single_side_param("single_side_min_aspect_ratio", 1.35)
+            max_aspect_ratio = float(self.cfg.pipeline.max_tube_length_px)
 
-        # Step 2 — Find contours (RETR_EXTERNAL only)
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        mask = self._preprocess_depth(
+            depth_frame,
+            depth_min,
+            depth_max,
+            initial_mask=initial_mask,
+            remove_bottom_components=False,
         )
-        used_nearest_fallback = False
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
-            nearest_mask = self._nearest_object_mask(depth_frame, band_m=0.06)
-            H, W = nearest_mask.shape
-            suppress_rows = int(round(H * 0.16))
-            if suppress_rows > 0:
-                nearest_mask[H - suppress_rows:, :] = 0
-            contours, _ = cv2.findContours(
-                nearest_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if contours:
-                used_nearest_fallback = True
-                logger.debug(
-                    f"[extract_multi] nearest-depth fallback produced {len(contours)} contours"
-                )
-            else:
-                logger.warning("[extract_multi] No contours found in depth frame")
-                return []
+            logger.warning("[multi_side] No contours found in depth frame")
+            return []
 
-        logger.debug(f"[extract_multi] findContours found {len(contours)} raw contours")
+        logger.debug(f"[multi_side] findContours found {len(contours)} raw contours")
 
-        # Step 3 — Apply filters to each contour
-        candidates = []
+        H, W = mask.shape
+        passing: list[tuple[int, int, int, int]] = []
+
         for contour in contours:
-            # Filter A — Area gate
             area = cv2.contourArea(contour)
-            contour_min_area = min_area_px
-            if used_nearest_fallback:
-                contour_min_area = max(220.0, min_area_px * 0.30)
-            if not (contour_min_area <= area <= self.cfg.pipeline.max_roi_area_px):
+            if not (min_area_px <= area <= self.cfg.pipeline.max_roi_area_px):
+                logger.debug(
+                    f"[multi_side] REJECT area={area:.0f} "
+                    f"(allowed [{min_area_px:.0f}, {self.cfg.pipeline.max_roi_area_px}])"
+                )
                 continue
 
-            # Filter B — Use minAreaRect for orientation-invariant dimensions
             rect = cv2.minAreaRect(contour)
-            (cx, cy), (rw, rh), angle = rect
-
+            (_, _), (rw, rh), _ = rect
             short_dim = min(rw, rh)
             long_dim = max(rw, rh)
 
-            # Filter C — Dimension validation
-            contour_min_short = min_short_px
-            contour_min_long = min_long_px
-            if used_nearest_fallback:
-                contour_min_short = max(12.0, min_short_px * 0.70)
-                contour_min_long = max(30.0, min_long_px * 0.60)
+            if not (min_short_px <= short_dim <= self.cfg.pipeline.max_tube_dim_px):
+                logger.debug(
+                    f"[multi_side] REJECT short_dim={short_dim:.1f} "
+                    f"(allowed [{min_short_px:.1f}, {self.cfg.pipeline.max_tube_dim_px}])"
+                )
+                continue
+            if not (min_long_px <= long_dim <= self.cfg.pipeline.max_tube_length_px):
+                logger.debug(
+                    f"[multi_side] REJECT long_dim={long_dim:.1f} "
+                    f"(allowed [{min_long_px:.1f}, {self.cfg.pipeline.max_tube_length_px}])"
+                )
+                continue
 
-            if not (contour_min_short <= short_dim <= self.cfg.pipeline.max_tube_dim_px):
-                continue
-            if not (contour_min_long <= long_dim <= self.cfg.pipeline.max_tube_length_px):
-                continue
-            if orientation == 'angled':
-                min_aspect_ratio = float(getattr(self.cfg.pipeline, 'angled_min_aspect_ratio', 1.05))
-                max_aspect_ratio = float(getattr(self.cfg.pipeline, 'angled_max_aspect_ratio', 5.0))
-            else:
-                min_aspect_ratio = self._single_side_param("single_side_min_aspect_ratio", 1.35)
-                max_aspect_ratio = float(self.cfg.pipeline.max_tube_length_px)
             aspect_ratio = long_dim / (short_dim + 1e-6)
-            if aspect_ratio < min_aspect_ratio or aspect_ratio > max_aspect_ratio:
+            if not (min_aspect_ratio <= aspect_ratio <= max_aspect_ratio):
+                logger.debug(
+                    f"[multi_side] REJECT aspect={aspect_ratio:.2f} "
+                    f"(allowed [{min_aspect_ratio:.2f}, {max_aspect_ratio:.2f}])"
+                )
                 continue
 
-            # Filter D — TRUE solidity using convex hull
             hull = cv2.convexHull(contour)
             hull_area = cv2.contourArea(hull)
             if hull_area == 0:
+                logger.debug("[multi_side] REJECT hull_area=0")
                 continue
             solidity = area / hull_area
-
             if solidity < self.cfg.pipeline.min_solidity:
+                logger.debug(
+                    f"[multi_side] REJECT solidity={solidity:.3f} "
+                    f"(min {self.cfg.pipeline.min_solidity})"
+                )
                 continue
 
-            # Filter E — Border margin check
             box_pts = cv2.boxPoints(rect).astype(np.int32)
             x, y, w, h = cv2.boundingRect(box_pts)
             bbox_short = float(min(w, h))
@@ -1185,75 +1204,75 @@ class DepthROIExtractor:
             min_bbox_short = self._single_side_param("single_side_min_bbox_short_px", 26.0)
             min_bbox_long = self._single_side_param("single_side_min_bbox_long_px", 60.0)
             if bbox_short < min_bbox_short or bbox_long < min_bbox_long:
+                logger.debug(
+                    f"[multi_side] REJECT bbox_dims=({w}x{h}) "
+                    f"(min short={min_bbox_short:.1f}, long={min_bbox_long:.1f})"
+                )
                 continue
-            m = self.cfg.pipeline.border_margin_px
-            H, W = mask.shape
-            if x < m or y < m or x + w > W - m or y + h > H - m:
+
+            margin = self.cfg.pipeline.border_margin_px
+            if x < margin or y < margin or x + w > W - margin or y + h > H - margin:
+                logger.debug(
+                    f"[multi_side] REJECT border_margin: bbox=({x},{y},{w},{h}) "
+                    f"frame=({W}x{H}) margin={margin}"
+                )
                 continue
 
             if self._is_holder_like_candidate(x, y, w, h, (H, W)):
+                logger.debug(
+                    f"[multi_side] REJECT holder_like: bbox=({x},{y},{w},{h})"
+                )
                 continue
 
-            if self._is_tray_like(x, y, w, h, area, solidity, (H, W)):
+            tray_max_roi_area_ratio = self._single_side_param(
+                "multi_side_max_roi_area_ratio",
+                0.035,
+            )
+            if self._is_tray_like(
+                x,
+                y,
+                w,
+                h,
+                area,
+                solidity,
+                (H, W),
+                max_roi_area_ratio_override=tray_max_roi_area_ratio,
+            ):
+                area_ratio = area / float(max(H * W, 1))
+                logger.debug(
+                    f"[multi_side] REJECT tray_like: bbox=({x},{y},{w},{h}) "
+                    f"area_ratio={area_ratio:.4f} "
+                    f"max_roi_area_ratio={tray_max_roi_area_ratio:.4f} "
+                    f"solidity={solidity:.3f}"
+                )
                 continue
 
-            score = self._candidate_score(
-                x=x,
-                y=y,
-                w=w,
-                h=h,
-                short_dim=short_dim,
-                long_dim=long_dim,
-                solidity=solidity,
-                frame_shape=(H, W),
+            x, y, w, h = self._refine_with_candidate_depth(
+                depth_frame=depth_frame,
+                contour=contour,
+                fallback_bbox=(x, y, w, h),
             )
+            x, y, w, h = self._expand_single_side_bbox((x, y, w, h), mask.shape)
 
-            candidates.append((contour, x, y, w, h, solidity, short_dim, long_dim, score))
-
-        if not candidates:
-            logger.debug("[extract_multi] 0 candidates after all filters")
-            return []
-
-        # Step 2 — Score floor (relative to best)
-        best_score = max(c[-1] for c in candidates)
-        floor = score_ratio * best_score
-        candidates = [c for c in candidates if c[-1] >= floor]
-
-        # Step 3 — NMS: sort by score desc, suppress if IoU > threshold with any kept
-        candidates.sort(key=lambda c: c[-1], reverse=True)
-        kept = []
-        for cand in candidates:
-            cx1, cy1, cw, ch = cand[1], cand[2], cand[3], cand[4]
-            cx2, cy2 = cx1 + cw, cy1 + ch
-            suppressed = False
-            for kept_cand in kept:
-                kx1, ky1, kw, kh = kept_cand[1], kept_cand[2], kept_cand[3], kept_cand[4]
-                kx2, ky2 = kx1 + kw, ky1 + kh
-                inter_w = max(0, min(cx2, kx2) - max(cx1, kx1))
-                inter_h = max(0, min(cy2, ky2) - max(cy1, ky1))
-                inter_area = inter_w * inter_h
-                union_area = cw * ch + kw * kh - inter_area
-                iou = inter_area / union_area if union_area > 0 else 0.0
-                if iou > iou_threshold:
-                    suppressed = True
-                    break
-            if not suppressed:
-                kept.append(cand)
-
-        logger.debug(
-            f"extract_multi: {len(candidates)} candidates after score floor, {len(kept)} after NMS"
-        )
-
-        # Step 4 — Warn if result exceeds expected tube count
-        if len(kept) > expected_max:
-            logger.warning(
-                f"extract_multi: {len(kept)} ROIs detected, expected max {expected_max}. Verify scene."
+            new_bottom = self._find_tube_bottom_from_depth(
+                depth_frame, (x, y, w, h), orientation, is_inverted=is_inverted
             )
+            if new_bottom < y + h:
+                trimmed_h = new_bottom - y
+                if trimmed_h >= int(h * 0.50):
+                    h = trimmed_h
 
-        # Step 5 — Return bare bbox tuples, x-sorted for stable slot assignment
-        kept.sort(key=lambda c: c[1])
-        return [(c[1], c[2], c[3], c[4]) for c in kept]
+            logger.debug(
+                f"[multi_side] PASS: bbox=({x},{y},{w},{h}) "
+                f"short={short_dim:.1f} long={long_dim:.1f} "
+                f"solidity={solidity:.3f} area={area:.0f}"
+            )
+            passing.append((x, y, w, h))
 
+        passing.sort(key=lambda bbox: bbox[0])
+        logger.debug(f"[multi_side] {len(passing)} tube(s) detected: {passing}")
+        return passing
+    
     def extract_top(self, depth_frame: np.ndarray) -> tuple[int, int, int, int] | None:
         """Extract bounding box of tube from top-down depth view (single_top mode).
         

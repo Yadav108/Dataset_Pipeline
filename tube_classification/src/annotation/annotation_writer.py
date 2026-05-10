@@ -118,7 +118,8 @@ class AnnotationWriter:
             json.dump(metadata, f, indent=2)
         
         logger.info(
-            f"Annotation written: {image_id} → class={class_id} session={session_id}"
+            f"Annotation written: image_id={image_id} class={class_id} "
+            f"session={session_id} raw_dir={raw_dir} ann_dir={ann_dir}"
         )
 
     def write_image_metadata(
