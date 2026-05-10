@@ -23,6 +23,67 @@ class BBoxQualityFilter:
             f"[bbox_quality] REJECT reason={reason} "
             f"value={value:.3f} threshold={threshold:.3f}"
         )
+
+    def _is_low_quality_instance(
+        self,
+        bbox: dict,
+        sam_iou: float | None,
+        coverage_ratio: float,
+        capture_mode: str,
+    ) -> bool:
+        w = float(bbox.get("w", 0.0))
+        h = float(bbox.get("h", 0.0))
+        if w <= 0 or h <= 0:
+            self._log_reject("bbox_dim_invalid", min(w, h), 1.0)
+            return True
+
+        # Relaxed minimum bbox dimensions for close-range small tubes.
+        min_w = 40.0
+        min_h = 24.0
+        if w < min_w:
+            self._log_reject("bbox_width_min", w, min_w)
+            return True
+        if h < min_h:
+            self._log_reject("bbox_height_min", h, min_h)
+            return True
+
+        # Accept IoU >= 0.60 for SAM-quality gate.
+        min_iou = 0.60
+        if sam_iou is not None and float(sam_iou) < min_iou:
+            self._log_reject("sam_iou_min", float(sam_iou), min_iou)
+            return True
+
+        aspect_ratio = max(w, h) / (min(w, h) + 1e-6)
+
+        # single_side tubes may be landscape (wider than tall); only reject
+        # extreme outliers. Top mode remains stricter and near-circular.
+        if capture_mode in {"single_side", ""}:
+            max_aspect_ratio = 4.0
+            if aspect_ratio > max_aspect_ratio:
+                self._log_reject("aspect_ratio_max_single_side", aspect_ratio, max_aspect_ratio)
+                return True
+        else:
+            max_aspect_ratio = self.cfg.pipeline.top_max_circularity_ratio
+            if aspect_ratio > max_aspect_ratio:
+                self._log_reject("aspect_ratio_max_top", aspect_ratio, float(max_aspect_ratio))
+                return True
+
+        base_cov_min = float(self.cfg.pipeline.min_coverage_ratio)
+        bbox_area = w * h
+
+        # Close-range tubes occupy less bbox area; apply relaxed floor.
+        if bbox_area <= 8000:
+            coverage_min = min(base_cov_min, 0.24)
+        elif bbox_area <= 12000:
+            coverage_min = min(base_cov_min, 0.30)
+        else:
+            coverage_min = base_cov_min
+
+        if float(coverage_ratio) < coverage_min:
+            self._log_reject("coverage_ratio_min", float(coverage_ratio), coverage_min)
+            return True
+
+        return False
     
     def is_low_quality(self, metadata_path: Path) -> bool:
         """Check if annotation bbox quality is below threshold.
@@ -36,61 +97,26 @@ class BBoxQualityFilter:
         try:
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
-
-            bbox = metadata.get("bbox", {})
-            w = float(bbox.get("w", 0.0))
-            h = float(bbox.get("h", 0.0))
-            if w <= 0 or h <= 0:
-                self._log_reject("bbox_dim_invalid", min(w, h), 1.0)
-                return True
-
-            # Relaxed minimum bbox dimensions for close-range small tubes.
-            min_w = 40.0
-            min_h = 24.0
-            if w < min_w:
-                self._log_reject("bbox_width_min", w, min_w)
-                return True
-            if h < min_h:
-                self._log_reject("bbox_height_min", h, min_h)
-                return True
-
-            # Accept IoU >= 0.60 for SAM-quality gate.
-            sam_iou = metadata.get("sam_iou_score")
-            min_iou = 0.60
-            if sam_iou is not None and float(sam_iou) < min_iou:
-                self._log_reject("sam_iou_min", float(sam_iou), min_iou)
-                return True
-
             capture_mode = str(metadata.get("capture_mode", "")).lower()
-            aspect_ratio = max(w, h) / (min(w, h) + 1e-6)
 
-            # single_side tubes may be landscape (wider than tall); only reject
-            # extreme outliers. Top mode remains stricter and near-circular.
-            if capture_mode in {"single_side", ""}:
-                max_aspect_ratio = 4.0
-                if aspect_ratio > max_aspect_ratio:
-                    self._log_reject("aspect_ratio_max_single_side", aspect_ratio, max_aspect_ratio)
-                    return True
-            else:
-                max_aspect_ratio = self.cfg.pipeline.top_max_circularity_ratio
-                if aspect_ratio > max_aspect_ratio:
-                    self._log_reject("aspect_ratio_max_top", aspect_ratio, float(max_aspect_ratio))
-                    return True
+            instances = metadata.get("instances")
+            if isinstance(instances, list) and instances:
+                for instance in instances:
+                    if self._is_low_quality_instance(
+                        bbox=instance.get("bbox", {}),
+                        sam_iou=instance.get("sam_iou_score"),
+                        coverage_ratio=float(instance.get("coverage_ratio", 0.0)),
+                        capture_mode=capture_mode,
+                    ):
+                        return True
+                return False
 
-            coverage_ratio = float(metadata.get("coverage_ratio", 0.0))
-            base_cov_min = float(self.cfg.pipeline.min_coverage_ratio)
-            bbox_area = w * h
-
-            # Close-range tubes occupy less bbox area; apply relaxed floor.
-            if bbox_area <= 8000:
-                coverage_min = min(base_cov_min, 0.24)
-            elif bbox_area <= 12000:
-                coverage_min = min(base_cov_min, 0.30)
-            else:
-                coverage_min = base_cov_min
-
-            if coverage_ratio < coverage_min:
-                self._log_reject("coverage_ratio_min", coverage_ratio, coverage_min)
+            if self._is_low_quality_instance(
+                bbox=metadata.get("bbox", {}),
+                sam_iou=metadata.get("sam_iou_score"),
+                coverage_ratio=float(metadata.get("coverage_ratio", 0.0)),
+                capture_mode=capture_mode,
+            ):
                 return True
 
             return False
@@ -156,13 +182,24 @@ class BBoxQualityFilter:
                     shutil.copy2(str(src_file), str(dst_raw_dir / filename))
             
             # Copy annotation files
-            ann_files = [
-                f"{image_id}_bbox.json",
-                f"{image_id}_mask.png",
-                f"{image_id}_mask_crop.png",
-                f"{image_id}_metadata.json",
-            ]
-            for filename in ann_files:
+            ann_files = {f"{image_id}_metadata.json", f"{image_id}_bbox.json", f"{image_id}_mask.png", f"{image_id}_mask_crop.png"}
+            try:
+                with open(metadata_file, "r") as f:
+                    metadata = json.load(f)
+                instances = metadata.get("instances")
+                if isinstance(instances, list):
+                    for inst in instances:
+                        mask_file = inst.get("mask_file")
+                        if isinstance(mask_file, str) and mask_file:
+                            ann_files.add(mask_file)
+                            if mask_file.startswith(f"{image_id}_mask_") and mask_file.endswith(".png"):
+                                idx = mask_file[len(f"{image_id}_mask_"):-4]
+                                if idx:
+                                    ann_files.add(f"{image_id}_rgb_nobg_{idx}.png")
+            except Exception:
+                pass
+
+            for filename in sorted(ann_files):
                 src_file = ann_dir / filename
                 if src_file.exists():
                     shutil.copy2(str(src_file), str(dst_ann_dir / filename))

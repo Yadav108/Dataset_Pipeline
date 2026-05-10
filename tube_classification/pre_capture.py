@@ -37,7 +37,7 @@ CLASS_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 VOLUME_PATTERN = re.compile(r"^\d+(\.\d+)?ml$")
 
 
-def _now() -> str:
+def _now() -> str: 
     return datetime.now().isoformat()
 
 
@@ -304,15 +304,15 @@ def _prompt_capture_mode() -> str:
     mode_map = {
         "1": "single_side",
         "2": "single_top",
-        "3": "multi_side",
-        "4": "multi_top",
+        "3": "multi_top",
+        "4": "multi_side",
     }
     while True:
         print("\nCapture mode:")
         print("  1: single_side  — side view, hand-held (R1.4 angle variation)")
         print("  2: single_top   — top-down, tube in rack (R1.4 angle variation)")
-        print("  3: multi_side   — side view, multiple tubes per frame")
-        print("  4: multi_top    — top-down, multiple tubes per frame (rack grid)")
+        print("  3: multi_top    — top-down, multiple tubes per frame (rack grid)")
+        print("  4: multi_side   — side view, multiple tubes per frame")
         print()
         user_input = input("Enter mode number (1, 2, 3, or 4): ").strip()
         if user_input in mode_map:

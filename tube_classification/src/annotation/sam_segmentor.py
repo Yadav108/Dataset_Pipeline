@@ -788,6 +788,7 @@ class SAMSegmentor:
         depth_frame: np.ndarray | None = None,
         orientation: str = 'side',
         is_inverted: bool = False,
+        neighbor_bboxes: list[tuple[int, int, int, int]] | None = None,
     ) -> tuple[np.ndarray, float] | None:
         """Run segmentation on RGB frame with holder-aware prompting.
 
@@ -839,6 +840,24 @@ class SAMSegmentor:
         # ─────────────────────────────────────────────────────────────
 
         tube_point_coords, tube_point_labels = self.build_tube_sam_prompts((x, y, w, h), orientation, is_inverted)
+
+        # Pre-compute neighbor negative points once (reused in retry pass)
+        _neighbor_neg: np.ndarray | None = None
+        if neighbor_bboxes:
+            frame_h, frame_w = rgb_frame.shape[:2]
+            _neg_pts = []
+            for nb in neighbor_bboxes:
+                nx, ny, nw, nh = nb
+                cx = int(np.clip(nx + nw // 2, 0, frame_w - 1))
+                _neg_pts.append([cx, int(np.clip(ny + nh // 2, 0, frame_h - 1))])
+                _neg_pts.append([cx, int(np.clip(ny + int(nh * 0.25), 0, frame_h - 1))])
+            _neighbor_neg = np.array(_neg_pts, dtype=np.float32)
+            tube_point_coords = np.vstack([tube_point_coords, _neighbor_neg])
+            tube_point_labels = np.concatenate([
+                tube_point_labels,
+                np.zeros(len(_neighbor_neg), dtype=np.int32),
+            ])
+
         masks, scores, _ = self.predictor.predict(
             point_coords=tube_point_coords,
             point_labels=tube_point_labels,
@@ -875,7 +894,13 @@ class SAMSegmentor:
             
             # Generate 5-point prompt
             point_coords, point_labels = self._get_point_coords(anchor_x, bbox, rgb_frame.shape)
-            
+            if _neighbor_neg is not None:
+                point_coords = np.vstack([point_coords, _neighbor_neg])
+                point_labels = np.concatenate([
+                    point_labels,
+                    np.zeros(len(_neighbor_neg), dtype=np.int32),
+                ])
+
             # Retry with points + box
             masks, scores, _ = self.predictor.predict(
                 point_coords=point_coords,
@@ -977,6 +1002,19 @@ class SAMSegmentor:
                 logger.debug(
                     f"Depth filter skipped: would reduce {pre_depth_area} → {post_depth_area}px² "
                     f"(keep<{min_depth_keep_ratio:.2f})"
+                )
+
+        # Re-close gaps that the depth filter may have opened in transparent tube body,
+        # then re-fill the contour interior so keep_tube_component sees a solid mask.
+        if depth_frame is not None and cv2.countNonZero(mask) > 0:
+            kernel_reclose = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_reclose, iterations=2)
+            _reclose_contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            if _reclose_contours:
+                cv2.drawContours(
+                    mask,
+                    [max(_reclose_contours, key=cv2.contourArea)],
+                    0, 255, -1,
                 )
 
         # ─────────────────────────────────────────────────────────────
@@ -1090,7 +1128,7 @@ class SAMSegmentor:
         masks, scores, _ = self.predictor.predict(
             point_coords=point_coords,
             point_labels=point_labels,
-            box=input_box[None, :],
+            box=input_box[None, :], 
             multimask_output=False,
         )
         

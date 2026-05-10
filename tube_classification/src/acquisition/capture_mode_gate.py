@@ -1,5 +1,234 @@
 from loguru import logger
 
+def run_multi_tube_assignment_gate() -> str:
+    """Prompt whether multi-capture frame contains same or different tube types."""
+    while True:
+        print("\nMulti-tube assignment:")
+        print("  1: same      — all detected tubes use the preselected class/volume")
+        print("  2: different — declare per-slot class/volume")
+        print()
+        user_input = input("Enter option (1 or 2): ").strip()
+        if user_input == "1":
+            logger.info("Multi-tube assignment selected: same")
+            return "same"
+        if user_input == "2":
+            logger.info("Multi-tube assignment selected: different")
+            return "different"
+        print("Invalid input. Enter 1 or 2.")
+
+
+def _prompt_volume_selection(available_tubes: list[dict]) -> tuple[float, list[dict]]:
+    """Prompt operator to declare a tube volume and return matching tube classes.
+
+    Loops until a valid volume is entered. If no registry match exists, offers
+    to create a minimal custom entry for that volume.
+
+    Args:
+        available_tubes: Full tube registry as a list of tube dicts.
+
+    Returns:
+        Tuple of (volume_ml, matched_tubes).
+    """
+    unique_volumes = sorted(set(t["volume_ml"] for t in available_tubes))
+
+    while True:
+        try:
+            raw = input(f"  Volume in ml {unique_volumes}: ").strip()
+            volume_ml = float(raw)
+        except ValueError:
+            print("  Invalid input. Enter a number.")
+            continue
+
+        matched = [t for t in available_tubes if t["volume_ml"] == volume_ml]
+
+        if not matched:
+            print(f"  No tube class for {volume_ml}ml. Available: {unique_volumes}")
+            confirm = input(f"  Create custom class for {volume_ml}ml? [y/n]: ").strip().lower()
+            if confirm == "y":
+                matched = [{"class_id": f"CUSTOM_{volume_ml}ml", "family": "CUSTOM", "volume_ml": volume_ml}]
+            else:
+                continue
+
+        return (volume_ml, matched)
+
+
+def _prompt_fill_level() -> dict:
+    """Prompt operator for fill level and return a metadata-ready dict."""
+    level_map = {
+        "f": ("full",  "operator_declared", 0.0),
+        "h": ("half",  "operator_declared", 0.5),
+        "e": ("empty", "operator_declared", 1.0),
+    }
+    while True:
+        raw = input("  Fill level [F]ull / [H]alf / [E]mpty: ").strip().lower()
+        if raw in level_map:
+            level, confidence, boundary_ratio = level_map[raw]
+            return {"level": level, "confidence": confidence, "boundary_ratio": boundary_ratio}
+        print("  Invalid. Enter F, H, or E.")
+
+
+def _prompt_class_selection(matched_tubes: list[dict]) -> str:
+    """Prompt operator to select a tube class from matched candidates.
+
+    If exactly one match, selects it silently. If multiple, presents a numbered
+    list and also accepts a freeform custom class name.
+
+    Args:
+        matched_tubes: List of tube dicts matching the declared volume.
+
+    Returns:
+        Selected class_id string (upper-case).
+    """
+    if len(matched_tubes) == 1:
+        class_id = matched_tubes[0]["class_id"]
+        print(f"  Class: {class_id}")
+        return class_id
+
+    print(f"  {len(matched_tubes)} classes match:")
+    for i, t in enumerate(matched_tubes):
+        print(f"    [{i}] {t['class_id']}")
+
+    while True:
+        raw = input("  Select class index or enter custom name: ").strip()
+
+        if raw.isdigit():
+            idx = int(raw)
+            if 0 <= idx < len(matched_tubes):
+                class_id = matched_tubes[idx]["class_id"]
+                print(f"  Selected: {class_id}")
+                return class_id
+            print(f"  Invalid index. Enter 0–{len(matched_tubes) - 1}.")
+            continue
+
+        if raw and len(raw) >= 3 and all(c.isalnum() or c == "_" for c in raw):
+            class_id = raw.upper()
+            confirm = input(f"  Confirm custom class '{class_id}'? [y/n]: ").strip().lower()
+            if confirm == "y":
+                print(f"  Using: {class_id}")
+                return class_id
+            continue
+
+        print("  Invalid. Use alphanumeric + underscore, min 3 chars.")
+
+
+def run_multi_slot_gate(
+    available_tubes: dict,
+    cfg,
+) -> list[dict]:
+    """Prompt operator to declare tube count and per-slot class/volume.
+
+    Step 1: asks for the number of tube slots in the frame (1–16).
+    Step 2: prompt slot direction in view (left→right or right→left).
+    Step 3: for each slot, calls _prompt_volume_selection() then
+            _prompt_class_selection() to collect (volume_ml, class_id).
+
+    Args:
+        available_tubes: Full tube registry (list of tube dicts).
+        cfg: App config (passed through; not used for file I/O here).
+
+    Returns:
+        List of slot dicts ordered to match detector x-sorted order
+        (left-to-right):
+        [{"slot": 0, "volume_ml": 4.0, "class_id": "VAC_LIGHT_BLUE",
+          "fill_level": {"level": "empty", "confidence": "operator_declared",
+                         "boundary_ratio": 1.0}}, ...]
+
+    Raises:
+        ValueError: If operator enters an invalid slot count on both attempts.
+    """
+    # Step 1 — slot count: two chances, then raise
+    n_slots: int | None = None
+    for attempt in range(2):
+        raw = input("Number of tube slots in frame: ").strip()
+        if raw.isdigit():
+            val = int(raw)
+            if 1 <= val <= 16:
+                n_slots = val
+                break
+        if attempt == 0:
+            print("  Invalid. Enter an integer between 1 and 16.")
+
+    if n_slots is None:
+        raise ValueError("Invalid slot count")
+
+    logger.info(f"Multi-slot declared: {n_slots} slots")
+
+    # Step 2 — slot direction mapping
+    slot_direction = "ltr"
+    while True:
+        raw = input(
+            "Slot order in preview? [1] left-to-right (default), [2] right-to-left: "
+        ).strip()
+        if raw in {"", "1"}:
+            slot_direction = "ltr"
+            break
+        if raw == "2":
+            slot_direction = "rtl"
+            break
+        print("  Invalid. Enter 1 or 2.")
+
+    # Step 3 — per-slot volume, class, and fill level
+    slots: list[dict] = []
+    for i in range(n_slots):
+        print(f"\nSlot {i} —")
+        volume_ml, matched = _prompt_volume_selection(available_tubes)
+        class_id = _prompt_class_selection(matched)
+        fill_level = _prompt_fill_level()
+        slots.append({
+            "slot": i,
+            "volume_ml": volume_ml,
+            "class_id": class_id,
+            "fill_level": fill_level,
+        })
+        logger.info(
+            f"  Slot {i}: {class_id} / {volume_ml}ml / fill={fill_level['level']}"
+        )
+
+    if slot_direction == "rtl":
+        slots = list(reversed(slots))
+        for i, slot in enumerate(slots):
+            slot["slot"] = i
+        logger.info("Slot mapping: right-to-left (reversed to match detector order)")
+    else:
+        logger.info("Slot mapping: left-to-right")
+
+    return slots
+
+
+def run_same_multi_fill_gate() -> list[dict]:
+    """Prompt operator for per-slot fill levels in same-class multi-tube mode.
+
+    Asks how many tubes are in the frame, then collects a fill level for each
+    slot in left-to-right (x-sorted) order.
+
+    Returns:
+        List of slot dicts: [{"slot": 0, "fill_level": {...}}, ...]
+    """
+    n_slots: int | None = None
+    for attempt in range(2):
+        raw = input("Number of tube slots in frame: ").strip()
+        if raw.isdigit():
+            val = int(raw)
+            if 1 <= val <= 16:
+                n_slots = val
+                break
+        if attempt == 0:
+            print("  Invalid. Enter an integer between 1 and 16.")
+
+    if n_slots is None:
+        raise ValueError("Invalid slot count")
+
+    logger.info(f"Same-class multi-slot: {n_slots} slots")
+
+    slots: list[dict] = []
+    for i in range(n_slots):
+        print(f"\nSlot {i} —")
+        fill_level = _prompt_fill_level()
+        slots.append({"slot": i, "fill_level": fill_level})
+        logger.info(f"  Slot {i}: fill={fill_level['level']}")
+
+    return slots
+
 
 def run_capture_mode_gate() -> str:
     """Prompt user to select capture mode.
@@ -8,23 +237,23 @@ def run_capture_mode_gate() -> str:
     selection (1, 2, 3, or 4) is provided.
     
     Returns:
-        str: One of "single_side", "single_top", "multi_side", or "multi_top"
+        str: One of "single_side", "single_top", or "multi_top"
     """
     mode_map = {
         "1": "single_side",
         "2": "single_top",
-        "3": "multi_side",
-        "4": "multi_top",
+        "3": "multi_top",
+        "4": "multi_side",
     }
-    
+
     while True:
         print("\nCapture mode:")
-        print("  1: single_side  — side view, hand-held (R1.4 angle variation)")
-        print("  2: single_top   — top-down, tube in rack (R1.4 angle variation)")
-        print("  3: multi_side   — side view, multiple tubes per frame")
-        print("  4: multi_top    — top-down, multiple tubes per frame (rack grid)")
+        print("  1: single_side  — side view, single tube per frame")
+        print("  2: single_top   — top-down, tube in rack grid, single tube per frame")
+        print("  3: multi_top    — top-down, multiple tubes per frame (rack grid)")
+        print("  4: multi_side   — side view, multiple tubes per frame")
         print()
-        
+
         user_input = input("Enter mode number (1, 2, 3, or 4): ").strip()
         
         if user_input in mode_map:
@@ -33,263 +262,3 @@ def run_capture_mode_gate() -> str:
             return mode
         else:
             print("Invalid input. Enter 1, 2, 3, or 4.")
-
-
-def run_multi_side_slot_gate() -> list[dict]:
-    """Declare tube slots for multi_side capture, left-to-right.
-
-    Asks whether tubes are the same class or different, then collects
-    per-slot info accordingly.
-
-    Returns:
-        List of dicts, one per slot, left-to-right order.
-        Each dict has keys: class_id, volume_ml, fill_level_result.
-    """
-    from src.acquisition.fill_level_detector import FillLevelResult, FillLevel
-
-    def _load_class_options() -> list[dict]:
-        try:
-            from pathlib import Path
-            import yaml
-
-            registry_path = Path("config/registry.yaml")
-            if not registry_path.exists():
-                return []
-
-            with registry_path.open("r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-
-            options = []
-            for tube in data.get("tubes", []):
-                class_id = str(tube.get("class_id", "")).strip().upper()
-                if not class_id:
-                    continue
-                options.append({
-                    "class_id": class_id,
-                    "volume_ml": float(tube.get("volume_ml", 0.0)),
-                    "family": str(tube.get("family", "")),
-                })
-            return sorted(options, key=lambda item: item["class_id"])
-        except Exception as e:
-            logger.warning(f"Could not load tube class list: {e}")
-            return []
-
-    class_options = _load_class_options()
-
-    def _ask_fill(slot_label: str) -> FillLevelResult:
-        while True:
-            prompt = f"  Fill level for {slot_label} [F]ull / [H]alf / [E]mpty: "
-            try:
-                import msvcrt
-
-                print(prompt, end="", flush=True)
-                key = msvcrt.getwch().strip().lower()
-                print(key.upper())
-            except Exception:
-                key = input(prompt).strip().lower()
-            if key == "f":
-                return FillLevelResult(
-                    level=FillLevel.FULL,
-                    confidence="operator_declared",
-                    boundary_ratio=0.0,
-                )
-            if key == "h":
-                return FillLevelResult(
-                    level=FillLevel.HALF,
-                    confidence="operator_declared",
-                    boundary_ratio=0.5,
-                )
-            if key == "e":
-                return FillLevelResult(
-                    level=FillLevel.EMPTY,
-                    confidence="operator_declared",
-                    boundary_ratio=1.0,
-                )
-            print("  Enter F, H, or E.")
-
-    def _ask_class_volume() -> tuple[str, float]:
-        class_id: str | None = None
-        if class_options:
-            volumes = sorted({option["volume_ml"] for option in class_options})
-            print("\n  Volumes:")
-            for idx, volume in enumerate(volumes, start=1):
-                print(f"  [{idx}] {volume:g}ml")
-            print("  [C] Custom volume/class")
-
-            while True:
-                raw = input("  Select volume number, volume ml, or C: ").strip().upper()
-                if raw == "C":
-                    volume_ml = None
-                    break
-                if raw.isdigit():
-                    index = int(raw)
-                    if 1 <= index <= len(volumes):
-                        volume_ml = volumes[index - 1]
-                        break
-                    print(f"  Invalid. Enter 1-{len(volumes)}, volume ml, or C.")
-                    continue
-
-                try:
-                    candidate_volume = float(raw.lower().replace("ml", ""))
-                except ValueError:
-                    print("  Invalid. Use a listed number, volume ml, or C.")
-                    continue
-
-                matched_volume = next(
-                    (
-                        volume for volume in volumes
-                        if abs(float(volume) - candidate_volume) < 1e-6
-                    ),
-                    None,
-                )
-                if matched_volume is not None:
-                    volume_ml = matched_volume
-                    break
-
-                confirm = input(f"  Use custom volume {candidate_volume:g}ml? [y/N]: ").strip().lower()
-                if confirm == "y":
-                    volume_ml = candidate_volume
-                    break
-
-            if volume_ml is not None:
-                volume_options = [
-                    option for option in class_options
-                    if abs(float(option["volume_ml"]) - float(volume_ml)) < 1e-6
-                ]
-                if volume_options:
-                    print(f"\n  Tube classes for {volume_ml:g}ml:")
-                    for idx, option in enumerate(volume_options, start=1):
-                        print(f"  [{idx}] {option['class_id']}  {option['family']}")
-                    print("  [C] Custom class")
-
-                    while True:
-                        raw = input("  Select class number, class name, or C: ").strip().upper()
-                        if raw == "C":
-                            break
-                        if raw.isdigit():
-                            index = int(raw)
-                            if 1 <= index <= len(volume_options):
-                                picked = volume_options[index - 1]
-                                return picked["class_id"], picked["volume_ml"]
-                            print(f"  Invalid. Enter 1-{len(volume_options)}, class name, or C.")
-                            continue
-
-                        picked = next(
-                            (
-                                option for option in volume_options
-                                if option["class_id"] == raw
-                            ),
-                            None,
-                        )
-                        if picked is not None:
-                            return picked["class_id"], picked["volume_ml"]
-
-                        if raw and all(c.isalnum() or c == "_" for c in raw):
-                            confirm = input(f"  Use custom class {raw} at {volume_ml:g}ml? [y/N]: ").strip().lower()
-                            if confirm == "y":
-                                return raw, float(volume_ml)
-                        else:
-                            print("  Invalid. Use a listed number, class name, or C.")
-                else:
-                    print(f"\n  No registered tube classes for {volume_ml:g}ml.")
-
-            if volume_ml is not None:
-                while True:
-                    class_id = input(f"  Class name for {volume_ml:g}ml (e.g. VAC_GREEN): ").strip().upper()
-                    if class_id and all(c.isalnum() or c == "_" for c in class_id):
-                        return class_id, float(volume_ml)
-                    print("  Invalid. Use alphanumeric and underscore only.")
-
-            # Custom volume path: ask volume first, then class manually.
-            while True:
-                raw_vol = input("  Volume ml: ").strip()
-                try:
-                    volume_ml = float(raw_vol)
-                    if volume_ml > 0:
-                        break
-                except ValueError:
-                    pass
-                print("  Enter a positive number.")
-        else:
-            print("\n  Tube class list unavailable; enter class manually.")
-            while True:
-                raw_vol = input("  Volume ml: ").strip()
-                try:
-                    volume_ml = float(raw_vol)
-                    if volume_ml > 0:
-                        break
-                except ValueError:
-                    pass
-                print("  Enter a positive number.")
-
-        if class_id is None:
-            while True:
-                class_id = input("  Class name (e.g. VAC_GREEN): ").strip().upper()
-                if class_id and all(c.isalnum() or c == "_" for c in class_id):
-                    break
-                print("  Invalid. Use alphanumeric and underscore only.")
-        return class_id, volume_ml
-
-    print("\n" + "=" * 60)
-    print("MULTI-SIDE SLOT DECLARATION (left -> right)")
-    print("=" * 60)
-
-    while True:
-        raw = input("How many tubes in frame? (2-6): ").strip()
-        if raw.isdigit() and 2 <= int(raw) <= 6:
-            n_slots = int(raw)
-            break
-        print("Enter a number between 2 and 6.")
-
-    print("\nAre the tubes:")
-    print("  1: Same class (same type, ask fill level per slot)")
-    print("  2: Different classes (ask class + volume + fill level per slot)")
-    while True:
-        choice = input("Enter 1 or 2: ").strip()
-        if choice in ("1", "2"):
-            break
-        print("Enter 1 or 2.")
-
-    slots = []
-
-    if choice == "1":
-        print("\n--- Tube class (applies to all slots) ---")
-        class_id, volume_ml = _ask_class_volume()
-
-        for i in range(n_slots):
-            pos = "leftmost" if i == 0 else "rightmost" if i == n_slots - 1 else f"{i + 1} from left"
-            fill = _ask_fill(f"slot {i} ({pos})")
-            slots.append({
-                "class_id": class_id,
-                "volume_ml": volume_ml,
-                "fill_level_result": fill,
-            })
-            logger.info(
-                f"Slot {i}: class={class_id}, volume={volume_ml}ml, "
-                f"fill={fill.level.value}"
-            )
-    else:
-        for i in range(n_slots):
-            pos = "leftmost" if i == 0 else "rightmost" if i == n_slots - 1 else f"{i + 1} from left"
-            print(f"\n--- Slot {i} ({pos}) ---")
-            class_id, volume_ml = _ask_class_volume()
-            fill = _ask_fill(f"slot {i}")
-            slots.append({
-                "class_id": class_id,
-                "volume_ml": volume_ml,
-                "fill_level_result": fill,
-            })
-            logger.info(
-                f"Slot {i}: class={class_id}, volume={volume_ml}ml, "
-                f"fill={fill.level.value}"
-            )
-
-    print("\n--- Slot summary ---")
-    for i, slot in enumerate(slots):
-        print(
-            f"  [{i}] {slot['class_id']}  {slot['volume_ml']}ml  "
-            f"{slot['fill_level_result'].level.value}"
-        )
-    print()
-
-    return slots

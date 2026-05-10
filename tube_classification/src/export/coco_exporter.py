@@ -44,8 +44,15 @@ class COCOExporter:
             try:
                 with open(metadata_file, "r") as f:
                     metadata = json.load(f)
-                class_id = metadata["class_id"]
-                unique_classes.add(class_id)
+                instances = metadata.get("instances")
+                if isinstance(instances, list) and instances:
+                    for instance in instances:
+                        class_id = instance.get("class_id")
+                        if class_id:
+                            unique_classes.add(class_id)
+                else:
+                    class_id = metadata["class_id"]
+                    unique_classes.add(class_id)
             except Exception:
                 continue
         
@@ -70,9 +77,8 @@ class COCOExporter:
                 
                 # Extract fields
                 image_id = metadata["image_id"]
-                class_id = metadata["class_id"]
                 image_shape = metadata["image_shape"]
-                bbox_data = metadata["bbox"]
+                instances = metadata.get("instances")
                 
                 # Build image entry
                 image_entry = {
@@ -83,23 +89,47 @@ class COCOExporter:
                 }
                 images.append(image_entry)
                 
-                # Build annotation entry
-                x = bbox_data["x"]
-                y = bbox_data["y"]
-                w = bbox_data["w"]
-                h = bbox_data["h"]
-                area = w * h
-                
-                annotation_entry = {
-                    "id": annotation_id,
-                    "image_id": image_idx,
-                    "category_id": class_to_id[class_id],
-                    "bbox": [x, y, w, h],
-                    "area": area,
-                    "iscrowd": 0,
-                }
-                annotations.append(annotation_entry)
-                annotation_id += 1
+                # Build annotation entries
+                if isinstance(instances, list) and instances:
+                    for instance in instances:
+                        bbox_data = instance.get("bbox", {})
+                        class_id = instance.get("class_id")
+                        if not class_id:
+                            continue
+                        x = bbox_data.get("x", 0)
+                        y = bbox_data.get("y", 0)
+                        w = bbox_data.get("w", 0)
+                        h = bbox_data.get("h", 0)
+                        area = w * h
+                        annotation_entry = {
+                            "id": annotation_id,
+                            "image_id": image_idx,
+                            "category_id": class_to_id[class_id],
+                            "bbox": [x, y, w, h],
+                            "area": area,
+                            "iscrowd": 0,
+                        }
+                        annotations.append(annotation_entry)
+                        annotation_id += 1
+                else:
+                    class_id = metadata["class_id"]
+                    bbox_data = metadata["bbox"]
+                    x = bbox_data["x"]
+                    y = bbox_data["y"]
+                    w = bbox_data["w"]
+                    h = bbox_data["h"]
+                    area = w * h
+
+                    annotation_entry = {
+                        "id": annotation_id,
+                        "image_id": image_idx,
+                        "category_id": class_to_id[class_id],
+                        "bbox": [x, y, w, h],
+                        "area": area,
+                        "iscrowd": 0,
+                    }
+                    annotations.append(annotation_entry)
+                    annotation_id += 1
             
             except Exception as e:
                 logger.warning(f"Failed to process {metadata_file.name}: {e}")

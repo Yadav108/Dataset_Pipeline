@@ -58,6 +58,8 @@ class PipelineConfig(BaseModel):
     border_margin_px: int = 20
     adaptive_depth_gate: bool = False
     remove_background_blobs: bool = True
+    single_side_depth_min_m: float = 0.32
+    single_side_depth_max_m: float = 0.56
     
     # Top-down mode shape filter
     top_min_roi_area_px: int = 200
@@ -86,6 +88,12 @@ class PipelineConfig(BaseModel):
 
     # Art/visualization export after session
     enable_art_export: bool = False
+
+    legacy_metadata: bool = True
+
+    multi_roi_score_ratio: float = 0.70
+    multi_roi_nms_iou_threshold: float = 0.30
+    multi_roi_expected_max: int = 4
 
     sam_iou_threshold: float
     depth_stability_threshold: float
